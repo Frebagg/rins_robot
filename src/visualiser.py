@@ -5,7 +5,7 @@ from rclpy.node import Node
 
 from visualization_msgs.msg import Marker
 import numpy as np
-from RINS_robot.msg import FaceCoords
+from rins_robot.msg import FaceCoords
 from geometry_msgs.msg import Point
 
 
@@ -23,12 +23,12 @@ class visualizeMarkers(Node):
 
 
     def manageFaceMarkers_callback(self,msg):
-        for face,id in msg:
+        if len(msg.points) != len(msg.ids):
+            return
+
+        for face, id in zip(msg.points, msg.ids):
             if id in self.faceMarkerIds: #ce je ta obraz ze markiran ignoriraj
                  continue
-            x = face.x
-            y = face.y
-            z = face.z
             marker = Marker()
             marker.header.frame_id = "map"
             marker.header.stamp = self.get_clock().now().to_msg()

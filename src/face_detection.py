@@ -18,7 +18,7 @@ from tf2_ros.buffer import Buffer
 from tf2_ros.transform_listener import TransformListener
 from geometry_msgs.msg import PointStamped
 from rclpy.duration import Duration
-from RINS_robot.msg import FaceCoords
+from rins_robot.msg import FaceCoords
 from geometry_msgs.msg import Point
 import time
 
