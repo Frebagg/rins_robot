@@ -35,7 +35,7 @@ class visualizeMarkers(Node):
             marker.ns = "faces"
             marker.id = id
             marker.type = Marker.SPHERE
-            scale = 0.7
+            scale = 0.5
             marker.scale.x = scale
             marker.scale.y = scale
             marker.scale.z = scale
@@ -45,7 +45,28 @@ class visualizeMarkers(Node):
             marker.color.b = 0.
             marker.color.a = 1.0
             marker.action = Marker.ADD
+            marker.pose.orientation.w = 1.0
             self.faceMarkerIds.append(id)
+
+            text = Marker()
+            text.header.frame_id = "map"
+            text.header.stamp = self.get_clock().now().to_msg()
+            text.ns = "faces_label"
+            text.id = id
+            text.type = Marker.TEXT_VIEW_FACING
+            text.pose.position.x = face.x
+            text.pose.position.y = face.y
+            text.pose.position.z = face.z + 0.5
+            text.scale.z = 0.5
+            text.color.r = 1.0
+            text.color.g = 1.0
+            text.color.b = 1.0
+            text.color.a = 1.0
+            text.text = f"Face {id}"
+            text.pose.orientation.w = 1.0
+            text.action = Marker.ADD
+
+            self.markerPublisher.publish(text)
             self.markerPublisher.publish(marker)
 
 
