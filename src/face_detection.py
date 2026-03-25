@@ -54,14 +54,17 @@ class detect_faces(Node):
 		self.coordPublisher = self.create_publisher(FaceCoords, "/face_coords", 10)
 		self.publishTimer = self.create_timer(1/5,self.publishFaces_callback)
 
-
+		#---------------------------------------------------------------------------------
+		#SPREMENLJIVKE ZA ZAZNAVANJE OBRAZOV
 		self.faces = []
-		self.coords = [] #tukaj notri sta Point() in stevilo detekcij zanj
+		self.coords = [] #tukaj notri so (id, Point(), stevilo detekcij)
+		self.nextFaceId = 1
 		self.COUNTTHRESHOLD = 7 #za spreminjat,treba testirat
 		self.CONFIDENCETHRESHOLD = 0.5
 		self.lastSeen = []
 		self.counter= 0 #za določanje kdaj se sprozi cleanFaceList
-		#self.listProcessed = True
+		#---------------------------------------------------------------------------------
+		
 
 		self.get_logger().info(f"Face detection node initialized!")
 
@@ -88,7 +91,7 @@ class detect_faces(Node):
 					cx = int(((vertices[0]+vertices[2])/2))
 					cy = int(((vertices[1]+vertices[3])/2))
 					self.faces.append((cx,cy))
-					if confidence > bestConf:
+					if confidence > bestConf:	
 						bestConf = confidence
 						best_bbox = vertices
 						best_center = (cx, cy)
@@ -130,7 +133,7 @@ class detect_faces(Node):
 				y = detection.point.y
 				z = detection.point.z
 				newFace = True
-				for i,(face,count) in enumerate(self.coords):
+				for i,(id,face,count) in enumerate(self.coords):
 					xx = face.x
 					yy = face.y
 					zz = face.z
@@ -139,10 +142,11 @@ class detect_faces(Node):
 						face.x = (x+xx)/2 #povpreci lokacijo ponovno zaznanih
 						face.y = (y+yy)/2
 						face.z = (z+zz)/2
-						self.coords[i] = (face, count+1)
+						self.coords[i] = (id,face, count+1)
 						self.lastSeen[i] = self.get_clock().now()
 				if newFace:
-					self.coords.append((detection.point,1))
+					self.coords.append((self.nextFaceId,detection.point,1))
+					self.nextFaceId += 1
 					self.lastSeen.append(self.get_clock().now())
 			
 		if self.counter >= 30:
@@ -187,8 +191,9 @@ class detect_faces(Node):
 
 	def publishFaces_callback(self):
 		pub = FaceCoords()
-		for face,count in self.coords:
+		for face_id,face,count in self.coords:
 			if count >= self.COUNTTHRESHOLD:
+				pub.ids.append(face_id)
 				pub.points.append(face)
 		self.coordPublisher.publish(pub)
 
