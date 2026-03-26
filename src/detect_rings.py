@@ -51,7 +51,7 @@ class RingDetector(Node):
         cv2.namedWindow("Detected rings", cv2.WINDOW_NORMAL)
         cv2.namedWindow("Depth window", cv2.WINDOW_NORMAL)        
 
-    def image_callback(self, data, depth):
+    def image_callback(self, data):
         try:
             cv_image = self.bridge.imgmsg_to_cv2(data, "bgr8")
         except CvBridgeError as e:
@@ -134,8 +134,8 @@ class RingDetector(Node):
             h, w = self.latest_depth.shape[:2]
             
             
-            cx = le[0][0]
-            cy = le[0][1]
+            cx = int(le[0][0])
+            cy = int(le[0][1])
             
             if not (0 <= cx < w and 0 <= cy < h):
                 continue
@@ -174,8 +174,8 @@ class RingDetector(Node):
                     if self.is_valid_depth(d):
                         ring_depths.append(d)
 
-            # if len(ring_depths) < 8: # myb
-            #     continue
+            if len(ring_depths) < 8: # myb
+                continue
 
             ring_depth = float(np.median(ring_depths)) # average? al pa use?
             
@@ -197,6 +197,21 @@ class RingDetector(Node):
             cv2.ellipse(cv_image, e1, (0, 255, 0), 2)
             cv2.ellipse(cv_image, e2, (0, 255, 0), 2)
 
+            color_name = self.classify_ring_color(cv_image, e1, e2)
+            # cx = int(e1[0][0]) # za izris barve?
+            # cy = int(e1[0][1])
+
+            # cv2.circle(cv_image, (cx, cy), 3, (0, 0, 255), -1)
+            # cv2.putText(
+            #     cv_image,
+            #     color_name,
+            #     (cx + 10, cy),
+            #     cv2.FONT_HERSHEY_SIMPLEX,
+            #     0.6,
+            #     (0, 255, 0),
+            #     2
+            # )
+            
             # Get a bounding box, around the first ellipse ('average' of both elipsis)
             size = (e1[1][0]+e1[1][1])/2
             center = (e1[0][1], e1[0][0])
@@ -236,6 +251,60 @@ class RingDetector(Node):
 
         cv2.imshow("Depth window", image_viz)
         cv2.waitKey(1)
+        
+    def make_ring_mask(self, shape, larger_ellipse, smaller_ellipse):
+        mask_outer = np.zeros(shape[:2], dtype=np.uint8)
+        mask_inner = np.zeros(shape[:2], dtype=np.uint8)
+
+        cv2.ellipse(mask_outer, larger_ellipse, 255, thickness=-1)
+        cv2.ellipse(mask_inner, smaller_ellipse, 255, thickness=-1)
+
+        ring_mask = cv2.subtract(mask_outer, mask_inner)
+        return ring_mask #maska z 255 na obroču in 0 drugje
+
+    def classify_ring_color(self, bgr_image, larger_ellipse, smaller_ellipse):
+        ring_mask = self.make_ring_mask(bgr_image.shape, larger_ellipse, smaller_ellipse)
+
+        hsv = cv2.cvtColor(bgr_image, cv2.COLOR_BGR2HSV)
+        ring_pixels = hsv[ring_mask > 0]
+
+        if len(ring_pixels) < 20:
+            return "unknown"
+
+        h = ring_pixels[:, 0]
+        s = ring_pixels[:, 1]
+        v = ring_pixels[:, 2]
+
+        # Najprej odstrani skoraj sive / bele / črne piksle
+        colored = ring_pixels[s > 60]
+
+        if len(colored) < 10: # če je malo barvnih pixlov ni barvast krog
+            median_v = float(np.median(v))
+            if median_v > 180:
+                return "white"
+            elif median_v < 60:
+                return "black"
+            else:
+                return "gray"
+
+        hue_vals = colored[:, 0]
+        median_h = float(np.median(hue_vals))
+
+        # H je med 0-179
+        if median_h < 10 or median_h >= 170: # tuki zna bit median problem pri rdeči
+            return "red"
+        elif median_h < 25:
+            return "orange"
+        elif median_h < 35:
+            return "yellow"
+        elif median_h < 85:
+            return "green"
+        elif median_h < 130:
+            return "blue"
+        elif median_h < 170:
+            return "purple"
+
+        return "unknown"
 
 
 def main():
