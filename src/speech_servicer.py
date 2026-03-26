@@ -20,7 +20,7 @@ class speech_servicer(Node):
 
     def greet(self,req,res):
         phrase = req.data
-        self.engine.say(data)
+        self.engine.say(phrase)
         self.engine.runAndWait()
         res.success = True
         return res
