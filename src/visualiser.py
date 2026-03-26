@@ -81,7 +81,7 @@ class visualizeMarkers(Node):
             return
 
         for ring, id in zip(msg.points, msg.ids):
-            if id in self.ringMarkerIds: #ce je ta obraz ze markiran ignoriraj
+            if id in self.ringMarkerIds: #ce je ta ring ze markiran ignoriraj
                  continue
             marker = Marker()
             marker.header.frame_id = "map"
