@@ -20,6 +20,8 @@ class visualizeMarkers(Node):
 
         self.markerPublisher = self.create_publisher(Marker,"/face_marker",10)
 
+        self.get_logger().info(f"Visualisation node initialized!")
+
 
 
     def manageFaceMarkers_callback(self,msg):
