@@ -6,13 +6,21 @@ import cv2, math
 import numpy as np
 import tf2_ros
 
-from sensor_msgs.msg import Image
-from geometry_msgs.msg import PointStamped, Vector3, Pose
+from sensor_msgs.msg import Image, PointCloud2
+from sensor_msgs_py import point_cloud2 as pc2
+from rins_robot.msg import RingCoords
+from geometry_msgs.msg import PointStamped, Vector3, Pose, Point
 from cv_bridge import CvBridge, CvBridgeError
 from visualization_msgs.msg import Marker, MarkerArray
 from std_msgs.msg import ColorRGBA
 from rclpy.qos import QoSDurabilityPolicy, QoSHistoryPolicy
-from rclpy.qos import QoSProfile, QoSReliabilityPolicy
+from rclpy.qos import QoSProfile, QoSReliabilityPolicy, qos_profile_sensor_data
+
+import tf2_geometry_msgs as tfg
+from tf2_ros import TransformException
+from tf2_ros.buffer import Buffer
+from tf2_ros.transform_listener import TransformListener
+from rclpy.duration import Duration
 
 qos_profile = QoSProfile(
           durability=QoSDurabilityPolicy.TRANSIENT_LOCAL,
@@ -38,6 +46,22 @@ class RingDetector(Node):
         self.depth_thr = 0.10   # metri
         #self.min_valid_depth = 0.05
         #self.max_valid_depth = 5.0
+        
+        self.tf_buffer = Buffer()
+        self.tf_listener = TransformListener(self.tf_buffer, self)
+
+        self.pointcloud_sub = self.create_subscription(PointCloud2, "/oakd/rgb/preview/depth/points", self.checkRing_callback, qos_profile_sensor_data)
+
+        self.coordPublisher = self.create_publisher(RingCoords, "/ring_coords", 10)
+        self.publishTimer = self.create_timer(1/5, self.publishRings_callback)
+
+        #SPREMENLJIVKE ZA ZAZNAVANJE OBRAZOV
+        self.rings_2d = []
+        self.coords = []       # (id, Point(), count, color)
+        self.lastSeen = []
+        self.nextRingId = 1
+        self.COUNTTHRESHOLD = 4 #za spreminjat,treba testirat
+        self.counter = 0 #za določanje kdaj se sprozi cleanFaceList
 
         # An object we use for converting images between ROS format and OpenCV format
         self.bridge = CvBridge()
@@ -150,7 +174,7 @@ class RingDetector(Node):
                 continue
             center = int(np.median(vals)) # avg?
             
-            if self.is_valid_depth(center): # not?
+            if not self.is_valid_depth(center): # not?
                 continue
             
             #pol osi elips
@@ -198,8 +222,8 @@ class RingDetector(Node):
             cv2.ellipse(cv_image, e2, (0, 255, 0), 2)
 
             color_name = self.classify_ring_color(cv_image, e1, e2)
-            # cx = int(e1[0][0]) # za izris barve?
-            # cy = int(e1[0][1])
+            cx = int(e1[0][0]) # za izris barve?
+            cy = int(e1[0][1])
 
             # cv2.circle(cv_image, (cx, cy), 3, (0, 0, 255), -1)
             # cv2.putText(
@@ -211,6 +235,8 @@ class RingDetector(Node):
             #     (0, 255, 0),
             #     2
             # )
+            
+            self.rings_2d.append((cx, cy, color_name))
             
             # Get a bounding box, around the first ellipse ('average' of both elipsis)
             size = (e1[1][0]+e1[1][1])/2
@@ -306,6 +332,79 @@ class RingDetector(Node):
 
         return "unknown"
 
+    def checkRing_callback(self, data):
+        # get point cloud attributes
+        height = data.height
+        width = data.width
+        # get 3-channel representation of the point cloud in numpy format once per callback
+        a = pc2.read_points_numpy(data, field_names=("x", "y", "z"))
+        a = a.reshape((height, width, 3))
+
+        for cx, cy, color in self.rings_2d:
+            if cx < 0 or cy < 0 or cx >= width or cy >= height:
+                continue
+
+            d = a[cy, cx, :]
+            if np.isnan(d).any():
+                continue
+
+            detection = self.baseLink2Map(d)
+            if detection is None:
+                continue
+
+            x = detection.point.x
+            y = detection.point.y
+            z = detection.point.z
+
+            newRing = True
+            for i, (ring_id, ring_pt, count, ring_color) in enumerate(self.coords):
+                
+                if (abs(ring_pt.x - x) < 0.5 and abs(ring_pt.y - y) < 0.5 and abs(ring_pt.z - z) < 1.0) and (ring_color == color): #dovolj blizu in iste barve
+                    newRing = False
+                    ring_pt.x = (ring_pt.x + x) / 2 #povpreci lokacijo ponovno zaznanih
+                    ring_pt.y = (ring_pt.y + y) / 2
+                    ring_pt.z = (ring_pt.z + z) / 2
+                    self.coords[i] = (ring_id, ring_pt, count + 1, color)
+                    self.lastSeen[i] = self.get_clock().now()
+                    #break #?
+
+            if newRing:
+                self.coords.append((self.nextRingId, detection.point, 1, color))
+                self.lastSeen.append(self.get_clock().now())
+                self.nextRingId += 1
+
+        self.rings_2d.clear()
+
+        if self.counter >= 30:
+            self.counter = 0
+            self.cleanRingList()
+        self.counter += 1
+        #self.rings_2d.clear() #?
+    
+    def publishRings_callback(self):
+        pub = RingCoords()
+        for ring_id, ring_pt, count, color in self.coords:
+            if count >= self.COUNTTHRESHOLD:
+                pub.ids.append(ring_id)
+                pub.points.append(ring_pt)
+                pub.colors.append(color)
+        self.coordPublisher.publish(pub)
+        
+    def cleanRingList(self):
+        if len(self.coords) != len(self.lastSeen):
+            return
+
+        ixList = []
+        now = self.get_clock().now()
+        for i in range(len(self.lastSeen)):
+            if (now - self.lastSeen[i]).nanoseconds > 5000000000:
+                ixList.append(i)
+
+        offset = 0
+        for idx in ixList:
+            del self.coords[idx - offset]
+            del self.lastSeen[idx - offset]
+            offset += 1
 
 def main():
 

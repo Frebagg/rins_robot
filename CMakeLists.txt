@@ -11,12 +11,14 @@ find_package(geometry_msgs REQUIRED)
 
 rosidl_generate_interfaces(${PROJECT_NAME}
   "msg/FaceCoords.msg"
+  "msg/RingCoords.msg"
   DEPENDENCIES geometry_msgs
 )
 
 install(PROGRAMS
   src/face_detection.py
   src/visualiser.py
+  src/detect_rings.py
   DESTINATION lib/${PROJECT_NAME}
 )
 
