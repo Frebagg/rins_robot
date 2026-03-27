@@ -150,7 +150,7 @@ class RingDetector(Node):
                 continue
             center = int(np.median(vals)) # avg?
             
-            if self.is_valid_depth(center): # not?
+            if not self.is_valid_depth(center): # not?
                 continue
             
             #pol osi elips
