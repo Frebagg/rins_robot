@@ -2,7 +2,7 @@
 
 import rclpy
 from rclpy.node import Node
-import cv2, math
+import cv2
 import numpy as np
 import tf2_ros
 
@@ -15,255 +15,97 @@ from rclpy.qos import QoSDurabilityPolicy, QoSHistoryPolicy
 from rclpy.qos import QoSProfile, QoSReliabilityPolicy
 
 qos_profile = QoSProfile(
-          durability=QoSDurabilityPolicy.TRANSIENT_LOCAL,
-          reliability=QoSReliabilityPolicy.RELIABLE,
-          history=QoSHistoryPolicy.KEEP_LAST,
-          depth=1)
+    durability=QoSDurabilityPolicy.TRANSIENT_LOCAL,
+    reliability=QoSReliabilityPolicy.RELIABLE,
+    history=QoSHistoryPolicy.KEEP_LAST,
+    depth=1
+)
+
 
 class RingDetector(Node):
     def __init__(self):
         super().__init__('transform_point')
 
-        # Basic ROS stuff
-        timer_frequency = 5
-        timer_period = 1/timer_frequency
-
         # ellipse thresholds
         self.ecc_thr = 100
         self.ratio_thr = 1.5
-        self.center_thr = 10
-        
+        self.min_contour_points = 20
+
         # depth thresholds
         self.latest_depth = None
-        self.depth_thr = 0.10   # metri
-        #self.min_valid_depth = 0.05
-        #self.max_valid_depth = 5.0
+        self.depth_thr = 0.10
+        self.min_valid_depth = 0.05
+        self.max_valid_depth = 5.0
+        self.min_ring_depth_points = 12
+        self.min_center_depth_points = 8
 
-        # An object we use for converting images between ROS format and OpenCV format
+        # inner ellipse scale for "hole" check
+        self.inner_scale = 0.45
+
+        # threshold for depth gray image
+        self.depth_binary_threshold = 60
+
+        # bridge
         self.bridge = CvBridge()
 
-        # Subscribe to the image and/or depth topic
-        self.image_sub = self.create_subscription(Image, "/oakd/rgb/preview/image_raw", self.image_callback, 1)
-        self.depth_sub = self.create_subscription(Image, "/oakd/rgb/preview/depth", self.depth_callback, 1)
+        # subscribers
+        self.image_sub = self.create_subscription(
+            Image, "/oakd/rgb/preview/image_raw", self.image_callback, 1
+        )
+        self.depth_sub = self.create_subscription(
+            Image, "/oakd/rgb/preview/depth", self.depth_callback, 1
+        )
 
         cv2.namedWindow("Binary Image", cv2.WINDOW_NORMAL)
         cv2.namedWindow("Detected contours", cv2.WINDOW_NORMAL)
         cv2.namedWindow("Detected rings", cv2.WINDOW_NORMAL)
-        cv2.namedWindow("Depth window", cv2.WINDOW_NORMAL)        
-
-    def image_callback(self, data):
-        try:
-            cv_image = self.bridge.imgmsg_to_cv2(data, "bgr8")
-        except CvBridgeError as e:
-            print(e)
-
-        # Tranform image to grayscale
-        gray = cv2.cvtColor(cv_image, cv2.COLOR_BGR2GRAY)
-
-        # Binarize the image
-        thresh = cv2.adaptiveThreshold(gray, 255, cv2.ADAPTIVE_THRESH_MEAN_C, cv2.THRESH_BINARY, 15, 30)
-        cv2.imshow("Binary Image", thresh)
-
-        # Extract contours
-        contours, hierarchy = cv2.findContours(thresh, cv2.RETR_LIST, cv2.CHAIN_APPROX_SIMPLE)
-
-        # Example of how to draw the contours, only for visualization purposes
-        cv2.drawContours(gray, contours, -1, (255, 0, 0), 1)
-        cv2.imshow("Detected contours", gray)
-
-        # Fit elipses to all extracted contours
-        elps = []
-        for cnt in contours:
-            if cnt.shape[0] >= 20:
-                ellipse = cv2.fitEllipse(cnt)
-
-                # filter ellipses that are too eccentric
-                e = ellipse[1]
-                ecc1 = e[0]
-                ecc2 = e[1]
-
-                ratio = ecc1/ecc2 if ecc1>ecc2 else ecc2/ecc1
-                if ratio<=self.ratio_thr and ecc1<self.ecc_thr and ecc2<self.ecc_thr:
-
-                    elps.append(ellipse)
-
-        # Find two elipses with same centers
-        candidates1 = []
-        for n in range(len(elps)):
-            e1 = elps[n]
-
-            # display candidates
-            cv2.ellipse(cv_image, e1, (255, 255, 0), 1)
-            cv2.circle(cv_image, (int(e1[0][0]), int(e1[0][1])), 1, (255, 255, 0), -1)
-
-            for m in range(n + 1, len(elps)):
-                # e[0] is the center of the ellipse (x,y), e[1] are the lengths of major and minor axis (major, minor), e[2] is the rotation in degrees
-                
-                e1 = elps[n]
-                e2 = elps[m]
-                dist = np.sqrt(((e1[0][0] - e2[0][0]) ** 2 + (e1[0][1] - e2[0][1]) ** 2))
-                angle_diff = np.abs(e1[2] - e2[2])
-
-                # The centers of the two elipses should be within 10 pixels of each other
-
-                if dist >= self.center_thr:
-                    continue
-
-                e1_minor_axis = e1[1][0]
-                e1_major_axis = e1[1][1]
-
-                e2_minor_axis = e2[1][0]
-                e2_major_axis = e2[1][1]
-
-                if e1_major_axis>=e2_major_axis and e1_minor_axis>=e2_minor_axis: # the larger ellipse should have both axis larger
-                    le = e1 # e1 is larger ellipse
-                    se = e2 # e2 is smaller ellipse
-                elif e2_major_axis>=e1_major_axis and e2_minor_axis>=e1_minor_axis:
-                    le = e2 # e2 is larger ellipse
-                    se = e1 # e1 is smaller ellipse
-                else:
-                    continue # if one ellipse does not contain the other, it is not a ring
-                    
-                candidates1.append((le,se)) #tuki je blo prej e1, e2 upam da to nc ne sfuka
-        
-        candidates2 = []
-        for le, se in candidates1:
-            
-            if self.latest_depth is None:
-                continue
-            h, w = self.latest_depth.shape[:2]
-            
-            
-            cx = int(le[0][0])
-            cy = int(le[0][1])
-            
-            if not (0 <= cx < w and 0 <= cy < h):
-                continue
-            
-            #center = self.latest_depth[int(cy), int(cx)] #((center_x, center_y), (axis1, axis2), angle) , numpy ma [y,x] #easy verzija
-            
-            patch = self.latest_depth[(cy-2):(cy+3),(cx-2):(cx+3)] #5x5 pixel del za sredino
-            vals = patch[np.isfinite(patch)]
-            #vals = vals[(vals > self.min_valid_depth) & (vals < self.max_valid_depth)]
-
-            if len(vals) == 0:
-                continue
-            center = int(np.median(vals)) # avg?
-            
-            if not self.is_valid_depth(center): # not?
-                continue
-            
-            #pol osi elips
-            outer_a = max(le[1][0], le[1][1]) / 2.0
-            outer_b = min(le[1][0], le[1][1]) / 2.0
-
-            inner_a = max(se[1][0], se[1][1]) / 2.0
-            inner_b = min(se[1][0], se[1][1]) / 2.0
-            
-            ring_depths = []
-            for angle in np.linspace(0, 2 * np.pi, 24, endpoint=False): # 24 razlicnih tock v sredini ringa
-                # polmer nekje med notranjo in zunanjo elipso
-                a = (outer_a + inner_a) / 2.0
-                b = (outer_b + inner_b) / 2.0
-
-                x = int(cx + a * np.cos(angle))
-                y = int(cy + b * np.sin(angle))
-
-                if 0 <= x < w and 0 <= y < h:
-                    d = self.latest_depth[y, x]
-                    if self.is_valid_depth(d):
-                        ring_depths.append(d)
-
-            if len(ring_depths) < 8: # myb
-                continue
-
-            ring_depth = float(np.median(ring_depths)) # average? al pa use?
-            
-            if center <= ring_depth + self.depth_thr:
-                continue
-            
-            candidates2.append((le,se))
-        
-        print("Processing is done! found", len(candidates2), "candidates for rings")
-
-        # Plot the rings on the image
-        for c in candidates2:
-
-            # the centers of the ellipses
-            e1 = c[0]
-            e2 = c[1]
-
-            # drawing the ellipses on the image
-            cv2.ellipse(cv_image, e1, (0, 255, 0), 2)
-            cv2.ellipse(cv_image, e2, (0, 255, 0), 2)
-
-            color_name = self.classify_ring_color(cv_image, e1, e2)
-            # cx = int(e1[0][0]) # za izris barve?
-            # cy = int(e1[0][1])
-
-            # cv2.circle(cv_image, (cx, cy), 3, (0, 0, 255), -1)
-            # cv2.putText(
-            #     cv_image,
-            #     color_name,
-            #     (cx + 10, cy),
-            #     cv2.FONT_HERSHEY_SIMPLEX,
-            #     0.6,
-            #     (0, 255, 0),
-            #     2
-            # )
-            
-            # Get a bounding box, around the first ellipse ('average' of both elipsis)
-            size = (e1[1][0]+e1[1][1])/2
-            center = (e1[0][1], e1[0][0])
-
-            x1 = int(center[0] - size / 2)
-            x2 = int(center[0] + size / 2)
-            x_min = x1 if x1>0 else 0
-            x_max = x2 if x2<cv_image.shape[0] else cv_image.shape[0]
-
-            y1 = int(center[1] - size / 2)
-            y2 = int(center[1] + size / 2)
-            y_min = y1 if y1 > 0 else 0
-            y_max = y2 if y2 < cv_image.shape[1] else cv_image.shape[1]
-
-        cv2.imshow("Detected rings", cv_image)
-        cv2.waitKey(1)
+        cv2.namedWindow("Depth window", cv2.WINDOW_NORMAL)
 
     def is_valid_depth(self, d):
-        return not (np.isnan(d) or d == 0) # and self.min_valid_depth < d < self.max_valid_depth # za zdaj pustimo
-    
-    def depth_callback(self,data):
+        return np.isfinite(d) and self.min_valid_depth < d < self.max_valid_depth
 
-        try:
-            depth_image = self.bridge.imgmsg_to_cv2(data, "32FC1")
-        except CvBridgeError as e:
-            print(e)
+    def depth_to_gray(self, depth):
+        d = depth.copy().astype(np.float32)
+        d[~np.isfinite(d)] = 0.0
+        d[(d < self.min_valid_depth) | (d > self.max_valid_depth)] = 0.0
 
-        depth_image[depth_image==np.inf] = 0
-        
-        self.latest_depth = depth_image.copy() 
-        
-        # Do the necessairy conversion so we can visuzalize it in OpenCV
-        image_1 = depth_image / 65536.0 * 255
-        image_1 = image_1/np.max(image_1)*255
+        out = np.zeros(d.shape, dtype=np.uint8)
+        valid = d[d > 0]
 
-        image_viz = np.array(image_1, dtype= np.uint8)
+        if len(valid) == 0:
+            return out
 
-        cv2.imshow("Depth window", image_viz)
-        cv2.waitKey(1)
-        
-    def make_ring_mask(self, shape, larger_ellipse, smaller_ellipse):
-        mask_outer = np.zeros(shape[:2], dtype=np.uint8)
-        mask_inner = np.zeros(shape[:2], dtype=np.uint8)
+        mn = np.min(valid)
+        mx = np.max(valid)
 
-        cv2.ellipse(mask_outer, larger_ellipse, 255, thickness=-1)
-        cv2.ellipse(mask_inner, smaller_ellipse, 255, thickness=-1)
+        if mx - mn < 1e-6:
+            return out
 
-        ring_mask = cv2.subtract(mask_outer, mask_inner)
-        return ring_mask #maska z 255 na obroču in 0 drugje
+        norm = (d - mn) / (mx - mn)
+        norm[d == 0] = 1.0
+        out = (norm * 255).astype(np.uint8)
+        return out
 
-    def classify_ring_color(self, bgr_image, larger_ellipse, smaller_ellipse):
-        ring_mask = self.make_ring_mask(bgr_image.shape, larger_ellipse, smaller_ellipse)
+    def scale_ellipse(self, ellipse, scale):
+        (cx, cy), (ax1, ax2), angle = ellipse
+        return ((cx, cy), (ax1 * scale, ax2 * scale), angle)
+
+    def make_filled_ellipse_mask(self, shape, ellipse):
+        mask = np.zeros(shape[:2], dtype=np.uint8)
+        cv2.ellipse(mask, ellipse, 255, thickness=-1)
+        return mask
+
+    def make_ring_mask_from_one_ellipse(self, shape, ellipse, inner_scale):
+        outer_mask = self.make_filled_ellipse_mask(shape, ellipse)
+        inner_ellipse = self.scale_ellipse(ellipse, inner_scale)
+        inner_mask = self.make_filled_ellipse_mask(shape, inner_ellipse)
+        ring_mask = cv2.subtract(outer_mask, inner_mask)
+        return ring_mask, inner_mask, inner_ellipse
+
+    def classify_ring_color(self, bgr_image, ellipse):
+        ring_mask, _, _ = self.make_ring_mask_from_one_ellipse(
+            bgr_image.shape, ellipse, self.inner_scale
+        )
 
         hsv = cv2.cvtColor(bgr_image, cv2.COLOR_BGR2HSV)
         ring_pixels = hsv[ring_mask > 0]
@@ -271,14 +113,11 @@ class RingDetector(Node):
         if len(ring_pixels) < 20:
             return "unknown"
 
-        h = ring_pixels[:, 0]
         s = ring_pixels[:, 1]
         v = ring_pixels[:, 2]
-
-        # Najprej odstrani skoraj sive / bele / črne piksle
         colored = ring_pixels[s > 60]
 
-        if len(colored) < 10: # če je malo barvnih pixlov ni barvast krog
+        if len(colored) < 10:
             median_v = float(np.median(v))
             if median_v > 180:
                 return "white"
@@ -290,8 +129,7 @@ class RingDetector(Node):
         hue_vals = colored[:, 0]
         median_h = float(np.median(hue_vals))
 
-        # H je med 0-179
-        if median_h < 10 or median_h >= 170: # tuki zna bit median problem pri rdeči
+        if median_h < 10 or median_h >= 170:
             return "red"
         elif median_h < 25:
             return "orange"
@@ -306,14 +144,166 @@ class RingDetector(Node):
 
         return "unknown"
 
+    def ellipse_is_ring(self, depth, ellipse):
+        ring_mask, inner_mask, inner_ellipse = self.make_ring_mask_from_one_ellipse(
+            depth.shape, ellipse, self.inner_scale
+        )
+
+        ring_depths = depth[ring_mask > 0]
+        ring_depths = ring_depths[np.isfinite(ring_depths)]
+        ring_depths = ring_depths[
+            (ring_depths > self.min_valid_depth) & (ring_depths < self.max_valid_depth)
+        ]
+
+        if len(ring_depths) < self.min_ring_depth_points:
+            return False, inner_ellipse
+
+        ring_depth = float(np.median(ring_depths))
+
+        center_depths = depth[inner_mask > 0]
+        center_depths = center_depths[np.isfinite(center_depths)]
+        center_depths = center_depths[
+            (center_depths > self.min_valid_depth) & (center_depths < self.max_valid_depth)
+        ]
+
+        if len(center_depths) < self.min_center_depth_points:
+            return True, inner_ellipse
+
+        center_depth = float(np.median(center_depths))
+
+        if center_depth > ring_depth + self.depth_thr:
+            return True, inner_ellipse
+
+        return False, inner_ellipse
+
+    def image_callback(self, data):
+        try:
+            cv_image = self.bridge.imgmsg_to_cv2(data, "bgr8")
+        except CvBridgeError as e:
+            print(e)
+            return
+
+        if self.latest_depth is None:
+            cv2.imshow("Detected rings", cv_image)
+            cv2.waitKey(1)
+            return
+
+        depth = self.latest_depth.copy()
+
+        if cv_image.shape[:2] != depth.shape[:2]:
+            print("RGB in depth nimata enake velikosti")
+            return
+
+        # DEPTH -> grayscale
+        depth_gray = self.depth_to_gray(depth)
+
+        # navaden threshold na depth sliki
+        _, thresh = cv2.threshold(
+            depth_gray,
+            self.depth_binary_threshold,
+            255,
+            cv2.THRESH_BINARY_INV
+        )
+
+        # če želiš adaptive threshold, lahko uporabiš to vrstico namesto zgornjih dveh:
+        # thresh = cv2.adaptiveThreshold(depth_gray, 255, cv2.ADAPTIVE_THRESH_MEAN_C, cv2.THRESH_BINARY_INV, 15, 5)
+
+        kernel = np.ones((3, 3), np.uint8)
+        thresh = cv2.morphologyEx(thresh, cv2.MORPH_OPEN, kernel)
+        thresh = cv2.morphologyEx(thresh, cv2.MORPH_CLOSE, kernel)
+
+        cv2.imshow("Binary Image", thresh)
+
+        contours, hierarchy = cv2.findContours(
+            thresh, cv2.RETR_LIST, cv2.CHAIN_APPROX_SIMPLE
+        )
+
+        contour_vis = cv2.cvtColor(depth_gray, cv2.COLOR_GRAY2BGR)
+        cv2.drawContours(contour_vis, contours, -1, (255, 0, 0), 1)
+        cv2.imshow("Detected contours", contour_vis)
+
+        elps = []
+        for cnt in contours:
+            if cnt.shape[0] < self.min_contour_points:
+                continue
+
+            ellipse = cv2.fitEllipse(cnt)
+
+            e = ellipse[1]
+            ecc1 = e[0]
+            ecc2 = e[1]
+
+            if ecc1 <= 0 or ecc2 <= 0:
+                continue
+
+            ratio = ecc1 / ecc2 if ecc1 > ecc2 else ecc2 / ecc1
+
+            if ratio <= self.ratio_thr and ecc1 < self.ecc_thr and ecc2 < self.ecc_thr:
+                elps.append(ellipse)
+
+        vis = cv_image.copy()
+        candidates = []
+
+        for ellipse in elps:
+            is_ring, inner_ellipse = self.ellipse_is_ring(depth, ellipse)
+
+            cv2.ellipse(vis, ellipse, (255, 255, 0), 1)
+            cx = int(ellipse[0][0])
+            cy = int(ellipse[0][1])
+            cv2.circle(vis, (cx, cy), 1, (255, 255, 0), -1)
+
+            if not is_ring:
+                continue
+
+            candidates.append((ellipse, inner_ellipse))
+
+        print("Processing is done! found", len(candidates), "candidates for rings")
+
+        for ellipse, inner_ellipse in candidates:
+            cv2.ellipse(vis, ellipse, (0, 255, 0), 2)
+            cv2.ellipse(vis, inner_ellipse, (0, 255, 0), 1)
+
+            cx = int(ellipse[0][0])
+            cy = int(ellipse[0][1])
+
+            color_name = self.classify_ring_color(cv_image, ellipse)
+
+            cv2.circle(vis, (cx, cy), 3, (0, 0, 255), -1)
+            cv2.putText(
+                vis,
+                color_name,
+                (cx + 10, cy),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.6,
+                (0, 255, 0),
+                2
+            )
+
+        cv2.imshow("Detected rings", vis)
+        cv2.waitKey(1)
+
+    def depth_callback(self, data):
+        try:
+            depth_image = self.bridge.imgmsg_to_cv2(data, "32FC1")
+        except CvBridgeError as e:
+            print(e)
+            return
+
+        depth_image = depth_image.astype(np.float32)
+        depth_image[depth_image == np.inf] = 0
+        depth_image[~np.isfinite(depth_image)] = 0
+
+        self.latest_depth = depth_image.copy()
+
+        image_viz = self.depth_to_gray(depth_image)
+        cv2.imshow("Depth window", image_viz)
+        cv2.waitKey(1)
+
 
 def main():
-
     rclpy.init(args=None)
     rd_node = RingDetector()
-
     rclpy.spin(rd_node)
-
     cv2.destroyAllWindows()
 
 

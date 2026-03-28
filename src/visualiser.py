@@ -5,12 +5,12 @@ from rclpy.node import Node
 
 from visualization_msgs.msg import Marker
 import numpy as np
-from rins_robot.msg import FaceCoords
+from rins_robot.msg import FaceCoords, RingCoords
 from geometry_msgs.msg import Point
 
 
 class visualizeMarkers(Node):
-    
+
     def __init__(self):
         super().__init__("visualizeMarkers")
 
@@ -18,7 +18,7 @@ class visualizeMarkers(Node):
         self.faceCoordClient = self.create_subscription(FaceCoords,"/face_coords",self.manageFaceMarkers_callback,10)
         self.faceMarkerIds = []
 
-        self.ringCoordClient = self.create_subscription(FaceCoords,"/ring_coords",self.manageRingMarkers_callback,10)
+        self.ringCoordClient = self.create_subscription(RingCoords,"/ring_coords",self.manageRingMarkers_callback,10)
         self.ringMarkerIds = []
 
         self.markerPublisher = self.create_publisher(Marker,"/face_marker",10)
@@ -75,13 +75,13 @@ class visualizeMarkers(Node):
             self.markerPublisher.publish(text)
             self.markerPublisher.publish(marker)
 
-        
+
     def manageRingMarkers_callback(self,msg):
-        if len(msg.points) != len(msg.ids):
+        if len(msg.points) != len(msg.ids) or len(msg.points) != len(msg.colors):
             return
 
-        for ring, id in zip(msg.points, msg.ids):
-            if id in self.ringMarkerIds: #ce je ta ring ze markiran ignoriraj
+        for ring, ring_id, color in zip(msg.points, msg.ids, msg.colors):
+            if ring_id in self.ringMarkerIds: #ce je ta ring ze markiran ignoriraj
                  continue
             marker = Marker()
             marker.header.frame_id = "map"
@@ -111,10 +111,11 @@ class visualizeMarkers(Node):
             text.pose.position.x = ring.x
             text.pose.position.y = ring.y
             text.pose.position.z = ring.z + 0.5
+            r, g, b = self.color_to_rgb(color)
             text.scale.z = 0.5
-            text.color.r = 1.0
-            text.color.g = 1.0
-            text.color.b = 1.0
+            text.color.r = r
+            text.color.g = g
+            text.color.b = b
             text.color.a = 1.0
             text.text = f"Ring {id}"
             text.pose.orientation.w = 1.0
@@ -123,6 +124,26 @@ class visualizeMarkers(Node):
             self.markerPublisher.publish(text)
             self.markerPublisher.publish(marker)
 
+def color_to_rgb(self, color_name):
+    if color_name == "red":
+        return (1.0, 0.0, 0.0)
+    elif color_name == "green":
+        return (0.0, 1.0, 0.0)
+    elif color_name == "blue":
+        return (0.0, 0.0, 1.0)
+    elif color_name == "yellow":
+        return (1.0, 1.0, 0.0)
+    elif color_name == "black":
+        return (0.1, 0.1, 0.1)
+    elif color_name == "white":
+        return (1.0, 1.0, 1.0)
+    elif color_name == "gray":
+        return (0.5, 0.5, 0.5)
+    elif color_name == "orange":
+        return (1.0, 0.647, 1.0)
+    elif color_name == "purple":
+        return (0.5, 0.0, 0.5)
+    return (0.5, 0.5, 0.5)
 
 def main():
 	print('Visualisation Node starting.')
@@ -134,4 +155,4 @@ def main():
 	rclpy.shutdown()
 
 if __name__ == '__main__':
-	main()
+    main()
