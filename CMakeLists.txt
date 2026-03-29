@@ -28,6 +28,9 @@ install(DIRECTORY
 install(PROGRAMS
   src/face_detection.py
   src/detect_rings.py
+  src/speech_servicer.py
+  src/robot_commander.py
+  src/robot_navigator.py
   src/visualiser.py
   src/speech_servicer.py
   DESTINATION lib/${PROJECT_NAME}

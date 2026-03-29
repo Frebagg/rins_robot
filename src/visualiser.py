@@ -83,67 +83,67 @@ class visualizeMarkers(Node):
         for ring, ring_id, color in zip(msg.points, msg.ids, msg.colors):
             if ring_id in self.ringMarkerIds: #ce je ta ring ze markiran ignoriraj
                  continue
+            r, g, b = self.color_to_rgb(color)
             marker = Marker()
             marker.header.frame_id = "map"
             marker.header.stamp = self.get_clock().now().to_msg()
             marker.ns = "rings"
-            marker.id = id + self.markerOffset
+            marker.id = ring_id + self.markerOffset
             marker.type = Marker.CUBE
             scale = 0.5
             marker.scale.x = scale
             marker.scale.y = scale
             marker.scale.z = scale
             marker.pose.position = ring
-            marker.color.r = 0.0
-            marker.color.g = 0.
-            marker.color.b = 1.0
+            marker.color.r = r
+            marker.color.g = g
+            marker.color.b = b
             marker.color.a = 1.0
             marker.action = Marker.ADD
             marker.pose.orientation.w = 1.0
-            self.ringMarkerIds.append(id)
+            self.ringMarkerIds.append(ring_id)
 
             text = Marker()
             text.header.frame_id = "map"
             text.header.stamp = self.get_clock().now().to_msg()
             text.ns = "rings_label"
-            text.id = id + self.markerOffset
+            text.id = ring_id + self.markerOffset
             text.type = Marker.TEXT_VIEW_FACING
             text.pose.position.x = ring.x
             text.pose.position.y = ring.y
             text.pose.position.z = ring.z + 0.5
-            r, g, b = self.color_to_rgb(color)
             text.scale.z = 0.5
             text.color.r = r
             text.color.g = g
             text.color.b = b
             text.color.a = 1.0
-            text.text = f"Ring {id}"
+            text.text = f"Ring {ring_id} ({color})"
             text.pose.orientation.w = 1.0
             text.action = Marker.ADD
 
             self.markerPublisher.publish(text)
             self.markerPublisher.publish(marker)
 
-def color_to_rgb(self, color_name):
-    if color_name == "red":
-        return (1.0, 0.0, 0.0)
-    elif color_name == "green":
-        return (0.0, 1.0, 0.0)
-    elif color_name == "blue":
-        return (0.0, 0.0, 1.0)
-    elif color_name == "yellow":
-        return (1.0, 1.0, 0.0)
-    elif color_name == "black":
-        return (0.1, 0.1, 0.1)
-    elif color_name == "white":
-        return (1.0, 1.0, 1.0)
-    elif color_name == "gray":
+    def color_to_rgb(self, color_name):
+        if color_name == "red":
+            return (1.0, 0.0, 0.0)
+        elif color_name == "green":
+            return (0.0, 1.0, 0.0)
+        elif color_name == "blue":
+            return (0.0, 0.0, 1.0)
+        elif color_name == "yellow":
+            return (1.0, 1.0, 0.0)
+        elif color_name == "black":
+            return (0.1, 0.1, 0.1)
+        elif color_name == "white":
+            return (1.0, 1.0, 1.0)
+        elif color_name == "gray":
+            return (0.5, 0.5, 0.5)
+        elif color_name == "orange":
+            return (1.0, 0.647, 0.0)
+        elif color_name == "purple":
+            return (0.5, 0.0, 0.5)
         return (0.5, 0.5, 0.5)
-    elif color_name == "orange":
-        return (1.0, 0.647, 1.0)
-    elif color_name == "purple":
-        return (0.5, 0.0, 0.5)
-    return (0.5, 0.5, 0.5)
 
 def main():
 	print('Visualisation Node starting.')
