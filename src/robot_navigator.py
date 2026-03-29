@@ -61,11 +61,7 @@ def load_pgm(yaml_path: str):
 def medial_axis_waypoints(pgm: np.ndarray,
                           resolution: float,
                           spacing: float = 0.8) -> list:
-    """
-    Skeletonise the free-space region and sample waypoints at *spacing* metres.
 
-    Returns a list of (col, row) pixel coordinate tuples.
-    """
     from skimage.morphology import skeletonize
 
     free = pgm > 205
@@ -264,7 +260,6 @@ class RobotNavigator(RobotCommander):
                 dx = node.pose.pose.position.x - point.x
                 dy = node.pose.pose.position.y - point.y
                 if math.hypot(dx, dy) < self.DEDUP_DIST:
-                    # Update position as a running average
                     node.pose.pose.position.x = (node.pose.pose.position.x + point.x) / 2.0
                     node.pose.pose.position.y = (node.pose.pose.position.y + point.y) / 2.0
                     return
@@ -289,9 +284,6 @@ class RobotNavigator(RobotCommander):
         self.info(f'[Detection] New {label} at '
                   f'({point.x:.2f}, {point.y:.2f}, {point.z:.2f})')
 
-    # ------------------------------------------------------------------
-    # Entry point
-    # ------------------------------------------------------------------
 
     def run(self):
         self.waitUntilNav2Active()
@@ -304,11 +296,80 @@ class RobotNavigator(RobotCommander):
         corners   = find_corners(wps, angle_threshold=self.CORNER_DEG)
         self.head = build_linked_list(wps, corners, info)
 
-        self.execute_coverage()   
-    
+        self.execute_coverage()
+
+
+    def execute_coverage(self):
+
+        while self.is_docked is None:
+            rclpy.spin_once(self, timeout_sec=0.5)
+        if self.is_docked:
+            self.undock()
+
+        current = self.head
+        while current is not None:
+            self.goToPose(current.pose)
+
+            while not self.isTaskComplete():
+                rclpy.spin_once(self, timeout_sec=0.1)
+
+            if current.kind == WaypointKind.CORNER:
+                self.info('[NAV] Corner waypoint – spinning 360°')
+                self.spin(2 * math.pi)
+                while not self.isTaskComplete():
+                    rclpy.spin_once(self, timeout_sec=0.1)
+
+            self._process_detections()
+
+            current = current.next
+
+        self._process_detections()
+        self.info('[NAV] Coverage complete.')
+
+    def _process_detections(self):
+        """Pop every node from the detected linked list and act on it."""
+        while self.detected_head is not None:
+            wp = self.detected_head
+            self.detected_head = self.detected_head.next
+            if self.detected_head is None:
+                self.detected_tail = None
+            wp.next = None
+
+            self.info(
+                f'[Detection] Visiting {wp.kind.name}'
+                + (f' color={wp.color}' if wp.color else '')
+                + f' at ({wp.pose.pose.position.x:.2f}, {wp.pose.pose.position.y:.2f})'
+            )
+
+            self.goToPose(wp.pose)
+            while not self.isTaskComplete():
+                rclpy.spin_once(self, timeout_sec=0.1)
+
+            result = self.getResult()
+            if result == TaskResult.SUCCEEDED:
+                if wp.kind == WaypointKind.FACE:
+                    self._greet_face(wp)
+                elif wp.kind == WaypointKind.RING:
+                    self._investigate_ring(wp)
+            else:
+                self.warn(f'[Detection] Navigation ended with {result} – skipping action.')
+
+    def _greet_face(self, wp: Waypoint):
+        self.info(f'[Action] Greeting face at ({wp.pose.pose.position.x:.2f}, {wp.pose.pose.position.y:.2f})')
+        self.spin(1.57)
+        while not self.isTaskComplete():
+            rclpy.spin_once(self, timeout_sec=0.1)
+
+    def _investigate_ring(self, wp: Waypoint):
+        color_info = f' ({wp.color})' if wp.color else ''
+        self.info(f'[Action] Investigating ring{color_info} at ({wp.pose.pose.position.x:.2f}, {wp.pose.pose.position.y:.2f})')
+        self.spin(math.pi)
+        while not self.isTaskComplete():
+            rclpy.spin_once(self, timeout_sec=0.1)
+
 def main():
     rclpy.init()
-    node = RobotNavigator()   # ← was "RoboNavigator()" (typo fixed)
+    node = RobotNavigator()  
     node.run()
     node.destroy_node()
     rclpy.shutdown()
