@@ -87,7 +87,7 @@ class visualizeMarkers(Node):
             marker.header.frame_id = "map"
             marker.header.stamp = self.get_clock().now().to_msg()
             marker.ns = "rings"
-            marker.id = id + self.markerOffset
+            marker.id = ring_id + self.markerOffset
             marker.type = Marker.CUBE
             scale = 0.5
             marker.scale.x = scale

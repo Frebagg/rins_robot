@@ -167,7 +167,8 @@ class RingDetector(Node):
 
             candidates.append((ellipse, inner_ellipse))
 
-        print("Processing is done! found", len(candidates), "candidates for rings")
+        if candidates:
+            print("Processing is done! found", len(candidates), "candidates for rings")
 
         # Plot the rings on the image
         for c in candidates:

@@ -1,30 +1,35 @@
 #!/usr/bin/env python3
 """
-Task executor for face and ring detection + interaction.
+task_executor.py — Random-waypoint patrol with detection-driven interrupts.
 
-Behaviour:
-  1. Waits for Nav2 to become ready.
-  2. Drives a configurable patrol route (waypoints covering all walls).
-  3. Whenever a new face or ring is detected, cancels the current patrol goal
-     and diverts to that detection.
-       - Face  → navigate to APPROACH_DIST from it, call /greet_service ("Hello!")
-       - Ring  → navigate to APPROACH_DIST from it, call /sayColor_service (color name)
-  4. After handling a detection, resumes the patrol at the next waypoint.
-  5. Any detections that arrive while already handling one are queued (FIFO).
-  6. Stops when all patrol waypoints have been visited.
+Patrol
+------
+On receiving the first /map message, N random free-space waypoints are sampled
+and pushed onto a deque (the "linked list").  The robot works through the deque
+head-to-tail.  After arriving at each patrol waypoint it does a full 360° spin
+so it can see in all directions before moving on.
+
+Detections
+----------
+Every new FaceCoords / RingCoords detection is inserted at the FRONT of the
+deque.  If the robot is currently navigating to a patrol waypoint, that goal is
+cancelled and the interrupted patrol node is pushed back to position [1] so it
+is visited right after the detection.  Duplicate detections (within 1 m of an
+already-queued one) are ignored.
 
 Parameters
 ----------
-patrol_waypoints : list[float]
-    Flat list of (x, y) pairs in map frame, e.g. [1.0, 0.5, 1.0, 2.0, ...].
-    If not provided, a default rectangular perimeter is used — adjust this to
-    match your actual map before running.
-approach_dist : float  (default 0.8)
-    Distance in metres at which the robot stops in front of a detection.
+n_waypoints    : int   (default 25)   number of random patrol waypoints
+approach_dist  : float (default 0.8)  stop this far from a detected object (m)
+min_wall_dist  : float (default 0.5)  minimum clearance from walls for sampled points (m)
+patrol_waypoints : float[] (optional) explicit flat [x0,y0, x1,y1, ...] override
 """
 
 import math
+import random
 import threading
+from collections import deque
+from typing import Optional
 
 import rclpy
 from rclpy.node import Node
@@ -34,7 +39,10 @@ from rclpy.executors import MultiThreadedExecutor
 
 from action_msgs.msg import GoalStatus
 from geometry_msgs.msg import PoseStamped
-from nav2_msgs.action import NavigateToPose
+from nav2_msgs.action import NavigateToPose, Spin
+from nav_msgs.msg import OccupancyGrid
+from sensor_msgs.msg import LaserScan
+from rclpy.qos import QoSProfile, DurabilityPolicy, ReliabilityPolicy
 
 import tf2_ros
 from tf2_ros import TransformException
@@ -43,10 +51,9 @@ from rins_robot.msg import FaceCoords, RingCoords
 from rins_robot.srv import Speech
 
 
-# ── helpers ───────────────────────────────────────────────────────────────────
+# ── helpers ────────────────────────────────────────────────────────────────────
 
 def yaw_to_quat(yaw: float):
-    """Return (x, y, z, w) quaternion for a pure-Z rotation."""
     return 0.0, 0.0, math.sin(yaw / 2.0), math.cos(yaw / 2.0)
 
 
@@ -56,7 +63,6 @@ def make_pose(frame: str, stamp, x: float, y: float, yaw: float = 0.0) -> PoseSt
     ps.header.stamp = stamp
     ps.pose.position.x = x
     ps.pose.position.y = y
-    ps.pose.position.z = 0.0
     qx, qy, qz, qw = yaw_to_quat(yaw)
     ps.pose.orientation.x = qx
     ps.pose.orientation.y = qy
@@ -65,312 +71,459 @@ def make_pose(frame: str, stamp, x: float, y: float, yaw: float = 0.0) -> PoseSt
     return ps
 
 
-# ── node ──────────────────────────────────────────────────────────────────────
+# ── waypoint node ──────────────────────────────────────────────────────────────
+
+class WaypointNode:
+    """Single node in the patrol deque / linked list."""
+    __slots__ = ('x', 'y', 'spin_after', 'dtype', 'det_id', 'color')
+
+    def __init__(self, x, y, spin_after=True, dtype=None, det_id=None, color=''):
+        self.x          = x
+        self.y          = y
+        self.spin_after = spin_after  # 360° spin on arrival (patrol nodes only)
+        self.dtype      = dtype       # None | 'face' | 'ring'
+        self.det_id     = det_id      # original detection ID (for visited tracking)
+        self.color      = color       # ring color
+
+
+# ── main node ──────────────────────────────────────────────────────────────────
 
 class TaskExecutor(Node):
-    """Patrol node that reacts to face/ring detections."""
 
-    # State machine labels
-    _S_IDLE      = 'IDLE'
-    _S_PATROLLING = 'PATROLLING'
-    _S_HANDLING  = 'HANDLING'
-    _S_DONE      = 'DONE'
+    _IDLE       = 'IDLE'
+    _PATROLLING = 'PATROLLING'
+    _HANDLING   = 'HANDLING'
+    _SPINNING   = 'SPINNING'
+    _DONE       = 'DONE'
+
+    # Detection deduplication threshold (metres)
+    _DUP_DIST = 1.0
 
     def __init__(self):
         super().__init__('task_executor')
 
-        # ── parameters ────────────────────────────────────────────────────────
-        self.declare_parameter('approach_dist', 0.8)
-        self.declare_parameter('patrol_waypoints', rclpy.Parameter.Type.DOUBLE_ARRAY)
+        # ── parameters ─────────────────────────────────────────────────────────
+        self.declare_parameter('n_waypoints',        25)
+        self.declare_parameter('approach_dist',      0.8)
+        self.declare_parameter('min_wall_dist',      0.5)
+        self.declare_parameter('patrol_waypoints',   [0.0])
+        # Area-triggered spin: fire a 360° when visible area grows by this many m²
+        self.declare_parameter('area_spin_gain',     3.0)
 
-        self._approach_dist: float = (
-            self.get_parameter('approach_dist').get_parameter_value().double_value
-        )
+        self._n_wp          = self.get_parameter('n_waypoints').value
+        self._approach      = self.get_parameter('approach_dist').value
+        self._min_wall      = self.get_parameter('min_wall_dist').value
+        self._area_spin_gain = self.get_parameter('area_spin_gain').value
 
-        # Default patrol: rectangular perimeter.
-        # IMPORTANT: Replace / extend these to match your actual map walls.
-        # Each pair (x, y) is a waypoint in the 'map' frame.
-        _default_waypoints = [
-            ( 1.5,  0.0),
-            ( 1.5,  1.5),
-            ( 0.0,  1.5),
-            (-1.5,  1.5),
-            (-1.5,  0.0),
-            (-1.5, -1.5),
-            ( 0.0, -1.5),
-            ( 1.5, -1.5),
-        ]
-        try:
-            flat = (
-                self.get_parameter('patrol_waypoints')
-                .get_parameter_value().double_array_value
-            )
-            if len(flat) >= 2:
-                self._waypoints = [
-                    (flat[i], flat[i + 1]) for i in range(0, len(flat) - 1, 2)
-                ]
-            else:
-                self._waypoints = _default_waypoints
-        except Exception:
-            self._waypoints = _default_waypoints
-
-        # ── callback group ─────────────────────────────────────────────────────
+        # ── callback group ──────────────────────────────────────────────────────
         self._cbg = ReentrantCallbackGroup()
 
-        # ── Nav2 action client ─────────────────────────────────────────────────
-        self._nav = ActionClient(
-            self, NavigateToPose, 'navigate_to_pose',
-            callback_group=self._cbg
-        )
+        # ── action clients ──────────────────────────────────────────────────────
+        self._nav  = ActionClient(self, NavigateToPose, 'navigate_to_pose',
+                                   callback_group=self._cbg)
+        self._spin_client = ActionClient(self, Spin, 'spin',
+                                          callback_group=self._cbg)
 
-        # ── detection subscribers ──────────────────────────────────────────────
-        self.create_subscription(
-            FaceCoords, '/face_coords', self._on_faces, 10,
-            callback_group=self._cbg
-        )
-        self.create_subscription(
-            RingCoords, '/ring_coords', self._on_rings, 10,
-            callback_group=self._cbg
-        )
+        # ── service clients ─────────────────────────────────────────────────────
+        self._greet_cli = self.create_client(Speech, '/greet_service',
+                                              callback_group=self._cbg)
+        self._color_cli = self.create_client(Speech, '/sayColor_service',
+                                              callback_group=self._cbg)
 
-        # ── speech service clients ─────────────────────────────────────────────
-        self._greet_cli = self.create_client(
-            Speech, '/greet_service', callback_group=self._cbg
+        # ── subscribers ─────────────────────────────────────────────────────────
+        map_qos = QoSProfile(
+            depth=1,
+            durability=DurabilityPolicy.TRANSIENT_LOCAL,
+            reliability=ReliabilityPolicy.RELIABLE,
         )
-        self._color_cli = self.create_client(
-            Speech, '/sayColor_service', callback_group=self._cbg
-        )
+        self.create_subscription(OccupancyGrid, '/map',
+                                  self._on_map, map_qos,
+                                  callback_group=self._cbg)
+        self.create_subscription(FaceCoords, '/face_coords',
+                                  self._on_faces, 10,
+                                  callback_group=self._cbg)
+        self.create_subscription(RingCoords, '/ring_coords',
+                                  self._on_rings, 10,
+                                  callback_group=self._cbg)
+        self.create_subscription(LaserScan, '/scan_filtered',
+                                  self._on_scan, 10,
+                                  callback_group=self._cbg)
 
-        # ── TF listener ───────────────────────────────────────────────────────
-        self._tf_buffer   = tf2_ros.Buffer()
-        self._tf_listener = tf2_ros.TransformListener(self._tf_buffer, self)
+        # ── TF ──────────────────────────────────────────────────────────────────
+        self._tf_buf      = tf2_ros.Buffer()
+        self._tf_listener = tf2_ros.TransformListener(self._tf_buf, self)
 
-        # ── internal state (protected by a lock) ──────────────────────────────
-        self._lock              = threading.Lock()
-        self._state             = self._S_IDLE
-        self._waypoint_idx      = 0
-        self._current_goal_hdl  = None   # accepted nav goal handle
+        # ── state ───────────────────────────────────────────────────────────────
+        self._lock          = threading.Lock()
+        self._state         = self._IDLE
+        self._wq: deque[WaypointNode] = deque()
+        self._current: Optional[WaypointNode] = None
+        self._nav_handle    = None
+        self._map_done      = False        # build route only once
 
-        # Detections pending interaction: list of dicts
-        #   {'type': 'face'|'ring', 'id': int, 'x': float, 'y': float, 'color': str}
-        self._pending: list = []
         self._visited_faces: set = set()
         self._visited_rings: set = set()
 
-        # ── start-up ──────────────────────────────────────────────────────────
+        # Scan-area tracking for room-entry detection
+        self._last_spin_area: float = 0.0   # visible area (m²) at the last spin
+        self._area_spin_pending: bool = False
+
         self.get_logger().info(
-            f'Task executor ready. {len(self._waypoints)} patrol waypoints. '
-            f'Approach dist={self._approach_dist} m. Waiting for Nav2…'
-        )
-        self._startup_timer = self.create_timer(
-            1.0, self._startup_check, callback_group=self._cbg
+            f'TaskExecutor ready — waiting for /map  '
+            f'(n_waypoints={self._n_wp}, approach_dist={self._approach} m)'
         )
 
-    # ── start-up ──────────────────────────────────────────────────────────────
+    # ══════════════════════════════════════════════════════════════════════════
+    # Map → build patrol deque
+    # ══════════════════════════════════════════════════════════════════════════
 
-    def _startup_check(self):
-        if self._nav.wait_for_server(timeout_sec=0.1):
-            self._startup_timer.cancel()
-            self.get_logger().info('Nav2 ready — starting patrol.')
-            with self._lock:
-                self._state = self._S_PATROLLING
-            self._advance()
+    def _on_map(self, msg: OccupancyGrid):
+        with self._lock:
+            if self._map_done:
+                return
+            self._map_done = True
 
-    # ── detection callbacks ────────────────────────────────────────────────────
+        self.get_logger().info('Map received — building patrol route.')
+        self._build_route(msg)
+
+        # Wait for Nav2
+        self.get_logger().info('Waiting for Nav2 action server…')
+        self._nav.wait_for_server()
+        self.get_logger().info('Nav2 ready — starting patrol.')
+        self._advance()
+
+    def _build_route(self, msg: OccupancyGrid):
+        # User-provided explicit waypoints override random sampling
+        flat = (self.get_parameter('patrol_waypoints')
+                    .get_parameter_value().double_array_value)
+        if len(flat) >= 2:
+            pts = [(flat[i], flat[i + 1]) for i in range(0, len(flat) - 1, 2)]
+            for x, y in pts:
+                self._wq.append(WaypointNode(x, y, spin_after=True))
+            self.get_logger().info(f'Using {len(pts)} user-provided waypoints.')
+            return
+
+        pts = self._sample_free(msg, self._n_wp)
+        for x, y in pts:
+            self._wq.append(WaypointNode(x, y, spin_after=True))
+        self.get_logger().info(f'Sampled {len(pts)} random patrol waypoints.')
+
+    def _sample_free(self, msg: OccupancyGrid, n: int):
+        """Grid-based sampling: divide map into n cells, pick one free point per
+        cell.  This guarantees uniform spatial coverage instead of clustering."""
+        res  = msg.info.resolution
+        ox   = msg.info.origin.position.x
+        oy   = msg.info.origin.position.y
+        w    = msg.info.width
+        h    = msg.info.height
+        data = msg.data
+        pad  = max(1, int(self._min_wall / res))
+
+        # Build a sqrt(n) x sqrt(n) grid over the navigable area
+        cols_g = max(1, int(math.ceil(math.sqrt(n))))
+        rows_g = max(1, int(math.ceil(n / cols_g)))
+        cell_w = max(1, (w - 2 * pad) / cols_g)
+        cell_h = max(1, (h - 2 * pad) / rows_g)
+
+        # Bucket every valid free cell into its grid square
+        buckets: dict = {}
+        for r in range(pad, h - pad):
+            for c in range(pad, w - pad):
+                if data[r * w + c] != 0:
+                    continue
+                if not all(data[(r + dr) * w + (c + dc)] == 0
+                           for dr in range(-pad, pad + 1)
+                           for dc in range(-pad, pad + 1)):
+                    continue
+                gi = min(int((r - pad) / cell_h), rows_g - 1)
+                gj = min(int((c - pad) / cell_w), cols_g - 1)
+                buckets.setdefault((gi, gj), []).append(
+                    (ox + (c + 0.5) * res, oy + (r + 0.5) * res)
+                )
+
+        if not buckets:
+            self.get_logger().warn('No free cells found — defaulting to origin.')
+            return [(0.0, 0.0)]
+
+        # One random point per occupied bucket, shuffled
+        pts = [random.choice(v) for v in buckets.values()]
+        random.shuffle(pts)
+        return pts[:n]
+
+    # ══════════════════════════════════════════════════════════════════════════
+    # ══════════════════════════════════════════════════════════════════════════
+    # Scan area — room-entry detection
+    # ══════════════════════════════════════════════════════════════════════════
+
+    def _on_scan(self, msg: LaserScan):
+        area = self._scan_polygon_area(msg)
+        with self._lock:
+            if self._state not in (self._PATROLLING,):
+                # Don't trigger while spinning, handling detections, or idle
+                self._last_spin_area = area
+                return
+            gain = area - self._last_spin_area
+            if gain > self._area_spin_gain and not self._area_spin_pending:
+                self._area_spin_pending = True
+                self.get_logger().info(
+                    f'Room entry detected — visible area grew by {gain:.1f} m² '
+                    f'({self._last_spin_area:.1f} → {area:.1f}). Queueing spin.'
+                )
+                # Insert a spin-only patrol node at the front of the queue
+                spin_node = WaypointNode(0.0, 0.0, spin_after=False, dtype='__spin__')
+                self._wq.appendleft(spin_node)
+                if self._nav_handle is not None:
+                    if self._current and self._current.dtype is None:
+                        self._wq.insert(1, self._current)
+                        self._current = None
+                    self._nav_handle.cancel_goal_async()
+                self._last_spin_area = area
+
+    @staticmethod
+    def _scan_polygon_area(msg: LaserScan) -> float:
+        """Shoelace area of the polygon formed by valid LIDAR ray endpoints."""
+        pts = []
+        for i, r in enumerate(msg.ranges):
+            if msg.range_min < r < msg.range_max:
+                a = msg.angle_min + i * msg.angle_increment
+                pts.append((r * math.cos(a), r * math.sin(a)))
+        if len(pts) < 3:
+            return 0.0
+        # Shoelace formula (points are already in angular order)
+        area = 0.0
+        n = len(pts)
+        for i in range(n):
+            j = (i + 1) % n
+            area += pts[i][0] * pts[j][1] - pts[j][0] * pts[i][1]
+        return abs(area) * 0.5
+
+    # Detection callbacks
+    # ══════════════════════════════════════════════════════════════════════════
 
     def _on_faces(self, msg: FaceCoords):
         for pt, fid in zip(msg.points, msg.ids):
             with self._lock:
                 if fid in self._visited_faces:
                     continue
-                if any(p['type'] == 'face' and p['id'] == fid for p in self._pending):
+                if self._already_queued(pt.x, pt.y):
                     continue
                 self.get_logger().info(
-                    f'New face  id={fid}  @ ({pt.x:.2f}, {pt.y:.2f})'
+                    f'New face id={fid} @ ({pt.x:.2f}, {pt.y:.2f}) — inserting'
                 )
-                self._pending.append({
-                    'type': 'face', 'id': fid,
-                    'x': pt.x, 'y': pt.y, 'color': ''
-                })
-                self._maybe_interrupt()
+                node = WaypointNode(pt.x, pt.y, spin_after=False,
+                                    dtype='face', det_id=fid)
+                self._insert_detection(node)
 
     def _on_rings(self, msg: RingCoords):
         for pt, rid, color in zip(msg.points, msg.ids, msg.colors):
             with self._lock:
                 if rid in self._visited_rings:
                     continue
-                if any(p['type'] == 'ring' and p['id'] == rid for p in self._pending):
+                if self._already_queued(pt.x, pt.y):
                     continue
                 self.get_logger().info(
-                    f'New ring  id={rid}  color={color}  @ ({pt.x:.2f}, {pt.y:.2f})'
+                    f'New ring id={rid} color={color} @ ({pt.x:.2f}, {pt.y:.2f}) — inserting'
                 )
-                self._pending.append({
-                    'type': 'ring', 'id': rid,
-                    'x': pt.x, 'y': pt.y, 'color': color
-                })
-                self._maybe_interrupt()
+                node = WaypointNode(pt.x, pt.y, spin_after=False,
+                                    dtype='ring', det_id=rid, color=color)
+                self._insert_detection(node)
 
-    def _maybe_interrupt(self):
-        """Cancel the active patrol goal so we divert to the detection.
+    def _already_queued(self, x, y):
+        """True if a detection within _DUP_DIST is already queued. (lock held)"""
+        def close(n):
+            return n.dtype is not None and math.hypot(n.x - x, n.y - y) < self._DUP_DIST
+        if self._current and close(self._current):
+            return True
+        return any(close(n) for n in self._wq)
 
-        Must be called with self._lock held.
-        """
-        if self._state == self._S_PATROLLING and self._current_goal_hdl is not None:
-            self._current_goal_hdl.cancel_goal_async()
+    def _insert_detection(self, node: WaypointNode):
+        """Insert at front; if patrolling, cancel nav and re-queue current node.
+        Must be called with self._lock held."""
+        self._wq.appendleft(node)
 
-    # ── navigation helpers ─────────────────────────────────────────────────────
+        if self._state == self._PATROLLING and self._nav_handle is not None:
+            # Push the interrupted patrol node back to position [1]
+            if self._current is not None and self._current.dtype is None:
+                self._wq.insert(1, self._current)
+                self._current = None
+            self._nav_handle.cancel_goal_async()
+
+    # ══════════════════════════════════════════════════════════════════════════
+    # Control flow
+    # ══════════════════════════════════════════════════════════════════════════
+
+    def _advance(self):
+        """Pop the next node and navigate to it."""
+        with self._lock:
+            if self._state == self._DONE:
+                return
+            if not self._wq:
+                self._state = self._DONE
+                self.get_logger().info('All waypoints visited — patrol complete!')
+                return
+
+            self._current = self._wq.popleft()
+            n = self._current
+            self._state = self._HANDLING if n.dtype else self._PATROLLING
+
+        # Spin-in-place node: no navigation, just do the 360° immediately
+        if n.dtype == '__spin__':
+            self.get_logger().info('[SPINNING] Area-triggered 360° spin')
+            self._do_spin()
+            return
+
+        self.get_logger().info(
+            f'[{self._state}] → ({n.x:.2f}, {n.y:.2f})'
+            + (f'  [{n.dtype} id={n.det_id}]' if n.dtype else '')
+        )
+
+        pose = (self._approach_pose(n.x, n.y) if n.dtype
+                else make_pose('map', self.get_clock().now().to_msg(), n.x, n.y))
+
+        self._send_nav(pose, self._on_nav_done)
+
+    def _on_nav_done(self, status: int):
+        with self._lock:
+            n = self._current
+            self._nav_handle = None
+
+        if status == GoalStatus.STATUS_CANCELED:
+            # Cancelled because a detection was inserted — just advance
+            self._advance()
+            return
+
+        if status != GoalStatus.STATUS_SUCCEEDED:
+            self.get_logger().warn(f'Nav failed (status={status}) — skipping.')
+            if n and n.dtype:
+                with self._lock:
+                    if n.dtype == 'face':
+                        self._visited_faces.add(n.det_id)
+                    else:
+                        self._visited_rings.add(n.det_id)
+            self._advance()
+            return
+
+        # Arrived — interact or spin
+        if n and n.dtype == 'face':
+            self._say(self._greet_cli, 'Hello!')
+            with self._lock:
+                self._visited_faces.add(n.det_id)
+                done = self._check_task_complete()
+            if done:
+                return
+            self._advance()
+
+        elif n and n.dtype == 'ring':
+            self._say(self._color_cli, n.color or 'unknown')
+            with self._lock:
+                self._visited_rings.add(n.det_id)
+                done = self._check_task_complete()
+            if done:
+                return
+            self._advance()
+
+        elif n and n.spin_after:
+            self._do_spin()
+
+        else:
+            self._advance()
+
+    def _check_task_complete(self) -> bool:
+        """Return True (and stop) if all targets have been found. Lock held."""
+        if len(self._visited_faces) >= 3 and len(self._visited_rings) >= 2:
+            self._state = self._DONE
+            self._wq.clear()
+            self.get_logger().info(
+                'Task complete! Found 3 faces and 2 rings — stopping patrol.'
+            )
+            return True
+        self.get_logger().info(
+            f'Progress: {len(self._visited_faces)}/3 faces, '
+            f'{len(self._visited_rings)}/2 rings'
+        )
+        return False
+
+    # ── 360° spin ──────────────────────────────────────────────────────────────
+
+    def _do_spin(self):
+        with self._lock:
+            self._state = self._SPINNING
+
+        goal = Spin.Goal()
+        goal.target_yaw = 2.0 * math.pi
+
+        if not self._spin_client.wait_for_server(timeout_sec=3.0):
+            self.get_logger().warn('Spin server not available — skipping spin.')
+            self._advance()
+            return
+
+        fut = self._spin_client.send_goal_async(goal)
+        fut.add_done_callback(self._on_spin_accepted)
+
+    def _on_spin_accepted(self, fut):
+        handle = fut.result()
+        if not handle.accepted:
+            self.get_logger().warn('Spin goal rejected — skipping.')
+            self._advance()
+            return
+        def _spin_done(_):
+            with self._lock:
+                self._area_spin_pending = False
+            self._advance()
+        handle.get_result_async().add_done_callback(_spin_done)
+
+    # ── navigation wrapper ─────────────────────────────────────────────────────
+
+    def _send_nav(self, pose: PoseStamped, on_done):
+        goal = NavigateToPose.Goal()
+        goal.pose = pose
+        fut = self._nav.send_goal_async(goal)
+
+        def _accepted(f):
+            handle = f.result()
+            if not handle.accepted:
+                self.get_logger().warn('Nav goal rejected.')
+                on_done(GoalStatus.STATUS_ABORTED)
+                return
+            with self._lock:
+                self._nav_handle = handle
+            handle.get_result_async().add_done_callback(
+                lambda rf: on_done(rf.result().status)
+            )
+
+        fut.add_done_callback(_accepted)
+
+    # ── approach pose ──────────────────────────────────────────────────────────
 
     def _robot_xy(self):
-        """Return (x, y) of base_link in map frame, or (0, 0) on failure."""
         try:
-            t = self._tf_buffer.lookup_transform(
-                'map', 'base_link', rclpy.time.Time()
-            )
+            t = self._tf_buf.lookup_transform('map', 'base_link', rclpy.time.Time())
             return t.transform.translation.x, t.transform.translation.y
         except TransformException:
             return 0.0, 0.0
 
     def _approach_pose(self, tx: float, ty: float) -> PoseStamped:
-        """Pose APPROACH_DIST in front of (tx, ty), facing it."""
         rx, ry = self._robot_xy()
         dx, dy = tx - rx, ty - ry
-        dist = math.hypot(dx, dy)
-        if dist < 1e-3:
-            dist = 1e-3
-        # Back off from target toward robot
+        dist = max(math.hypot(dx, dy), 1e-3)
         ux, uy = -dx / dist, -dy / dist
-        ax = tx + ux * self._approach_dist
-        ay = ty + uy * self._approach_dist
-        yaw = math.atan2(dy, dx)   # face the target
+        ax = tx + ux * self._approach
+        ay = ty + uy * self._approach
+        yaw = math.atan2(dy, dx)
         return make_pose('map', self.get_clock().now().to_msg(), ax, ay, yaw)
 
-    def _send_nav_goal(self, pose: PoseStamped, on_done):
-        """Send a NavigateToPose goal; call on_done(success: bool) when finished."""
-        goal_msg = NavigateToPose.Goal()
-        goal_msg.pose = pose
-
-        send_future = self._nav.send_goal_async(goal_msg)
-
-        def _goal_accepted(fut):
-            handle = fut.result()
-            if not handle.accepted:
-                self.get_logger().warn('Nav goal rejected.')
-                on_done(False)
-                return
-            with self._lock:
-                self._current_goal_hdl = handle
-            handle.get_result_async().add_done_callback(_got_result)
-
-        def _got_result(fut):
-            with self._lock:
-                self._current_goal_hdl = None
-            status = fut.result().status
-            on_done(status == GoalStatus.STATUS_SUCCEEDED)
-
-        send_future.add_done_callback(_goal_accepted)
-
-    # ── main control flow ──────────────────────────────────────────────────────
-
-    def _advance(self):
-        """Decide what to do next: handle a pending detection or resume patrol."""
-        with self._lock:
-            state   = self._state
-            pending = list(self._pending)
-
-        if state == self._S_DONE:
-            return
-
-        if pending:
-            self._handle_next()
-        else:
-            self._patrol_step()
-
-    def _patrol_step(self):
-        with self._lock:
-            idx = self._waypoint_idx
-            total = len(self._waypoints)
-
-        if idx >= total:
-            self.get_logger().info('Patrol complete. All waypoints visited.')
-            with self._lock:
-                self._state = self._S_DONE
-            return
-
-        wx, wy = self._waypoints[idx]
-        with self._lock:
-            self._waypoint_idx += 1
-            self._state = self._S_PATROLLING
-
-        self.get_logger().info(
-            f'Patrol waypoint {idx + 1}/{total}  → ({wx:.2f}, {wy:.2f})'
-        )
-        pose = make_pose('map', self.get_clock().now().to_msg(), wx, wy)
-
-        def _done(success):
-            if not success:
-                # Either cancelled (detection interrupt) or Nav2 failure — advance anyway
-                pass
-            self._advance()
-
-        self._send_nav_goal(pose, _done)
-
-    def _handle_next(self):
-        with self._lock:
-            if not self._pending:
-                # Race: another thread already handled it
-                self._state = self._S_PATROLLING
-                self._advance()
-                return
-            det = self._pending.pop(0)
-            self._state = self._S_HANDLING
-
-        self.get_logger().info(
-            f'Heading to {det["type"]} id={det["id"]}  '
-            f'@ ({det["x"]:.2f}, {det["y"]:.2f})'
-        )
-        pose = self._approach_pose(det['x'], det['y'])
-
-        def _arrived(success):
-            if success:
-                self._interact(det)
-            else:
-                self.get_logger().warn(
-                    f'Could not reach {det["type"]} id={det["id"]} — skipping.'
-                )
-
-            with self._lock:
-                if det['type'] == 'face':
-                    self._visited_faces.add(det['id'])
-                else:
-                    self._visited_rings.add(det['id'])
-                self._state = self._S_PATROLLING
-
-            self._advance()
-
-        self._send_nav_goal(pose, _arrived)
-
-    # ── interactions ──────────────────────────────────────────────────────────
-
-    def _interact(self, det: dict):
-        if det['type'] == 'face':
-            self._say(self._greet_cli, 'Hello!')
-            self.get_logger().info(f'Greeted face id={det["id"]}.')
-        else:
-            color = det['color'] or 'unknown color'
-            self._say(self._color_cli, color)
-            self.get_logger().info(f'Announced ring id={det["id"]} color={color}.')
+    # ── speech ─────────────────────────────────────────────────────────────────
 
     def _say(self, client, text: str):
         if not client.service_is_ready():
-            self.get_logger().warn(f'Speech service not ready, skipping: "{text}"')
+            self.get_logger().warn(f'Speech service not ready — skipping: "{text}"')
             return
         req = Speech.Request()
         req.data = text
-        # call_async — fire and forget (speech is non-blocking for the state machine)
-        client.call_async(req)
+        client.call_async(req)   # fire-and-forget
 
 
-# ── entry point ───────────────────────────────────────────────────────────────
+# ── entry point ────────────────────────────────────────────────────────────────
 
 def main(args=None):
     rclpy.init(args=args)
