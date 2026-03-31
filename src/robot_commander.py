@@ -308,7 +308,7 @@ def main(args=None):
         (0, 0.0, 0.0, 0),
         (1, 1.3, 1.8, 0),
         (2, 1.0, 2.3, 0),
-        (3, 0.0, 3.0, 0),
+        (3, 0.0, 2.75, 0),
         (4, -1.0, 2.5, 0),
         (5, -2.5, 2.5, 0),
         (6, -2.63, 1.55, 0),
@@ -325,22 +325,21 @@ def main(args=None):
     ]
     
     
-    while(True):
-        for id, x, y, yaw in koordinate:
-            goal_pose = PoseStamped()
-            goal_pose.header.frame_id = 'map'
-            goal_pose.header.stamp = rc.get_clock().now().to_msg()
+    for id, x, y, yaw in koordinate:
+        goal_pose = PoseStamped()
+        goal_pose.header.frame_id = 'map'
+        goal_pose.header.stamp = rc.get_clock().now().to_msg()
 
-            goal_pose.pose.position.x = x
-            goal_pose.pose.position.y = y
-            if yaw == 0:
-                goal_pose.pose.orientation = rc.YawToQuaternion(0)
+        goal_pose.pose.position.x = x
+        goal_pose.pose.position.y = y
+        if yaw == 0:
+            goal_pose.pose.orientation = rc.YawToQuaternion(0)
 
-            rc.goToPose(goal_pose)
+        rc.goToPose(goal_pose)
 
-            while not rc.isTaskComplete():
-                rc.info("Waiting for the task to complete...")
-                time.sleep(1)
+        while not rc.isTaskComplete():
+            rc.info("Waiting for the task to complete...")
+            time.sleep(1)
 
     rc.destroyNode()
     

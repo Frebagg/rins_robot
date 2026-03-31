@@ -106,9 +106,9 @@ class RingDetector(Node):
         # Naredimo binarno sliko kjer so beli samo piksli z globino v
         # želenem razponu [binary_depth_min, binary_depth_max].
         # S tem dobimo masko predmetov na primernih razdaljah.
-        # valid = np.isfinite(depth) & (depth > self.min_valid_depth) & (depth < self.max_valid_depth)
+        valid = np.isfinite(depth) & (depth > self.min_valid_depth) & (depth < self.max_valid_depth)
         thresh = np.zeros(depth.shape, dtype=np.uint8)
-        thresh[depth & (depth > self.binary_depth_min) & (depth < self.binary_depth_max)] = 255
+        thresh[valid & (depth > self.binary_depth_min) & (depth < self.binary_depth_max)] = 255
 
         # Morphološke operacije: OPEN odstrani šum, CLOSE zapolni luknje v konturah
         kernel = np.ones((3, 3), np.uint8)
