@@ -319,7 +319,6 @@ class RobotCommander(Node):
         ])
 
     def _build_standoff_goal(self, target_x, target_y, standoff_distance=0.30):
-        """Build a goal that stops before the target so we avoid inflated obstacle zones."""
         robotPos = self.get_robot_position()
         dx = target_x - robotPos[0]
         dy = target_y - robotPos[1]
@@ -330,7 +329,6 @@ class RobotCommander(Node):
         else:
             yaw = 0.0
 
-        # Keep at least `standoff_distance` from the detected object when possible.
         if dist > standoff_distance:
             goal_x = target_x - standoff_distance * np.cos(yaw)
             goal_y = target_y - standoff_distance * np.sin(yaw)
