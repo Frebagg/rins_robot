@@ -422,50 +422,47 @@ def main(args=None):
     # "yaw" == 7 : dol-levo
     
     koordinate = [
-        (0, 0.0, 0.0, 1),
-        (1, 1.3, 1.8, 4),
-        (2, 1.0, 2.3, 0),
-        (3, 0.0, 2.75, 0),
-        (4, -1.0, 2.5, 0),
-        (5, -2.5, 2.5, 0),
-        (6, -2.63, 1.55, 0),
-        (7, -1.8, 0.05, 0),
-        (8, -1.85, -1.2, 0),
-        (9, -1.1, -2.3, 0),
-        (10, 0.0, -1.6, 0),
-        (11, 0.0, -3.6, 0),
-        (12, 1.5, -3.5, 0),
-        (13, 1.4, -2.5, 0),
-        (14, 2.25, -1.3, 0),
-        (15, 1.35, -0.1, 0),
-        (16, -1.15, 1.3, 0)
+        (0, 0.0, 0.0, [1]),
+        (1, 1.3, 1.8, [4]),
+        (2, 0.5, 2.75, [1]),
+        (3, -1.2, 2.75, [2]),
+        (4, -2.6, 2.6, [1]),
+        (5, -1.9, 0.1, [2,3,0]),
+        (6, -1.85, -1.3, [3]),
+        (7, 0.0, -1.6, [3]),
+        (8, 1.4, -2.5, [5]),
+        (9, 2.3, -1.3, [2]),
+        (10, 1.0, 0.0, [1]),
+        (11, -1.15, 1.3, [1])
     ]
     
     #---------------------------------------------------------------------
     #PRVI KROG - DETEKCIJE
-    for id, x, y, yaw in koordinate: 
+    for id, x, y, tabela in koordinate: 
         goal_pose = PoseStamped()
         goal_pose.header.frame_id = 'map'
         goal_pose.header.stamp = rc.get_clock().now().to_msg()
 
         goal_pose.pose.position.x = x
         goal_pose.pose.position.y = y
-        if yaw == 0: # gor
-            goal_pose.pose.orientation = rc.YawToQuaternion(0)
-        elif yaw == 1: # desno
-            goal_pose.pose.orientation = rc.YawToQuaternion(-1.57)
-        elif yaw == 2: # dol
-            goal_pose.pose.orientation = rc.YawToQuaternion(3.14)
-        elif yaw == 3: # levo
-            goal_pose.pose.orientation = rc.YawToQuaternion(1.57)
-        elif yaw == 4: # gor-desno
-            goal_pose.pose.orientation = rc.YawToQuaternion(-0.785)
-        elif yaw == 5: # dol-desno
-            goal_pose.pose.orientation = rc.YawToQuaternion(-2.356)
-        elif yaw == 6: # gor-levo
-            goal_pose.pose.orientation = rc.YawToQuaternion(0.785)
-        elif yaw == 7: # dol-levo
-            goal_pose.pose.orientation = rc.YawToQuaternion(2.356)
+        
+        for yaw in tabela:
+            if yaw == 0: # gor
+                goal_pose.pose.orientation = rc.YawToQuaternion(0)
+            elif yaw == 1: # desno
+                goal_pose.pose.orientation = rc.YawToQuaternion(-1.57)
+            elif yaw == 2: # dol
+                goal_pose.pose.orientation = rc.YawToQuaternion(3.14)
+            elif yaw == 3: # levo
+                goal_pose.pose.orientation = rc.YawToQuaternion(1.57)
+            elif yaw == 4: # gor-desno
+                goal_pose.pose.orientation = rc.YawToQuaternion(-0.785)
+            elif yaw == 5: # dol-desno
+                goal_pose.pose.orientation = rc.YawToQuaternion(-2.356)
+            elif yaw == 6: # gor-levo
+                goal_pose.pose.orientation = rc.YawToQuaternion(0.785)
+            elif yaw == 7: # dol-levo
+                goal_pose.pose.orientation = rc.YawToQuaternion(2.356)
 
         rc.goToPose(goal_pose)
 
