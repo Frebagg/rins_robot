@@ -318,6 +318,63 @@ class RobotCommander(Node):
             self.current_pose.pose.position.z
         ])
 
+    def _build_standoff_goal(self, target_x, target_y, standoff_distance=0.30):
+        """Build a goal that stops before the target so we avoid inflated obstacle zones."""
+        robotPos = self.get_robot_position()
+        dx = target_x - robotPos[0]
+        dy = target_y - robotPos[1]
+        dist = np.hypot(dx, dy)
+
+        if dist > 1e-3:
+            yaw = np.arctan2(dy, dx)
+        else:
+            yaw = 0.0
+
+        # Keep at least `standoff_distance` from the detected object when possible.
+        if dist > standoff_distance:
+            goal_x = target_x - standoff_distance * np.cos(yaw)
+            goal_y = target_y - standoff_distance * np.sin(yaw)
+        else:
+            goal_x = target_x
+            goal_y = target_y
+
+        goal_pose = PoseStamped()
+        goal_pose.header.frame_id = 'map'
+        goal_pose.header.stamp = self.get_clock().now().to_msg()
+        goal_pose.pose.position.x = goal_x
+        goal_pose.pose.position.y = goal_y
+        goal_pose.pose.orientation = self.YawToQuaternion(yaw)
+
+        return goal_pose
+
+    def _go_close_enough(self, target_x, target_y, standoff_distance=0.30, close_enough_distance=0.60):
+        """Navigate to a standoff point and accept failures if we are still close enough."""
+        goal_pose = self._build_standoff_goal(target_x, target_y, standoff_distance)
+        self.goToPose(goal_pose)
+
+        self.info("Waiting for the task to complete...")
+        while not self.isTaskComplete():
+            time.sleep(1)
+
+        task_result = self.getResult()
+        if task_result == TaskResult.SUCCEEDED:
+            return True
+
+        robotPos = self.get_robot_position()
+        dist_to_target = np.hypot(target_x - robotPos[0], target_y - robotPos[1])
+        if dist_to_target <= close_enough_distance:
+            self.warn(
+                f"Navigation to exact detection point failed, but robot is close enough "
+                f"({dist_to_target:.2f} m). Continuing interaction."
+            )
+            return True
+
+        self.warn(
+            f"Navigation failed and robot is too far from detection "
+            f"({dist_to_target:.2f} m). Skipping interaction."
+        )
+        return False
+
     def visitDetections(self):
         #najprej obrazi
         request = Speech.Request()
@@ -330,25 +387,8 @@ class RobotCommander(Node):
             x = point.x
             y = point.y
 
-            goal_pose = PoseStamped()
-            goal_pose.header.frame_id = 'map'
-            goal_pose.header.stamp = self.get_clock().now().to_msg()
-
-            goal_pose.pose.position.x = x
-            goal_pose.pose.position.y = y
-
-            robotPos = self.get_robot_position()
-
-            dx = x - robotPos[0] #da se obrne proti obrazu
-            dy = y - robotPos[1]
-            yaw = np.arctan2(dy, dx)
-            goal_pose.pose.orientation = self.YawToQuaternion(yaw)
-
-            self.goToPose(goal_pose)
-
-            self.info("Waiting for the task to complete...")
-            while not self.isTaskComplete():
-                time.sleep(1)
+            if not self._go_close_enough(x, y, standoff_distance=0.30, close_enough_distance=0.60):
+                continue
             
             future = self.greetClient.call_async(request)
             rclpy.spin_until_future_complete(self,future)
@@ -365,26 +405,9 @@ class RobotCommander(Node):
             x = point.x
             y = point.y
             request.data = color
-            
-            goal_pose = PoseStamped()
-            goal_pose.header.frame_id = 'map'
-            goal_pose.header.stamp = self.get_clock().now().to_msg()
 
-            goal_pose.pose.position.x = x
-            goal_pose.pose.position.y = y
-
-            robotPos = self.get_robot_position()
-
-            dx = x - robotPos[0] #da se obrne proti ringu
-            dy = y - robotPos[1]
-            yaw = np.arctan2(dy, dx)
-            goal_pose.pose.orientation = self.YawToQuaternion(yaw)
-
-            self.goToPose(goal_pose)
-
-            self.info("Waiting for the task to complete...")
-            while not self.isTaskComplete():
-                time.sleep(1)
+            if not self._go_close_enough(x, y, standoff_distance=0.30, close_enough_distance=0.60):
+                continue
             
             future = self.sayColorClient.call_async(request)
             rclpy.spin_until_future_complete(self,future)
@@ -425,7 +448,7 @@ def main(args=None):
         (0, 0.0, 0.0, 1),
         (1, 1.3, 1.8, 4),
         (2, 0.5, 2.75, 1),
-        (3, -1.2, 2.75, 2),
+        (3, -1.2, 2.75, 0),
         (4, -2.6, 2.75, 4),
         (4.5, -2.5, 0.4, 0),
         (5, -1.9, -0.45, 3),
