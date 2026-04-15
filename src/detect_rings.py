@@ -64,9 +64,9 @@ class RingDetector(Node):
         self.tf_listener = TransformListener(self.tf_buffer, self)
 
         # Naročnine (subscribers)
-        self.image_sub = self.create_subscription(Image, "/oakd/rgb/preview/image_raw", self.image_callback, 1)
-        self.depth_sub = self.create_subscription(Image, "/oakd/rgb/preview/depth", self.depth_callback, 1)
-        self.pointcloud_sub = self.create_subscription(PointCloud2, "/oakd/rgb/preview/depth/points", self.pointcloud_callback, qos_profile_sensor_data)
+        self.image_sub = self.create_subscription(Image, "/gemini/color/image_raw", self.image_callback, 1)
+        self.depth_sub = self.create_subscription(Image, "/gemini/depth/image_raw", self.depth_callback, 1)
+        self.pointcloud_sub = self.create_subscription(PointCloud2, "/gemini/depth/points", self.pointcloud_callback, qos_profile_sensor_data)
 
         # Objava tabele obročev na /ring_coords vsakih 0.2 s
         self.coord_publisher = self.create_publisher(RingCoords, "/ring_coords", 10)

@@ -54,8 +54,8 @@ class detect_faces(Node):
 		self.tf_buffer = Buffer()
 		self.tf_listener = TransformListener(self.tf_buffer, self)
 
-		self.rgb_image_sub = self.create_subscription(Image, "/oakd/rgb/preview/image_raw", self.yolo_callback, qos_profile_sensor_data)
-		self.pointcloud_sub = self.create_subscription(PointCloud2, "/oakd/rgb/preview/depth/points", self.checkFace_callback, qos_profile_sensor_data)
+		self.rgb_image_sub = self.create_subscription(Image, "/gemini/color/image_raw", self.yolo_callback, qos_profile_sensor_data)
+		self.pointcloud_sub = self.create_subscription(PointCloud2, "/gemini/depth/points", self.checkFace_callback, qos_profile_sensor_data)
 		self.model = YOLO("yolov8n.pt")
 		if torch.cuda.is_available() and self.device != 'cpu':
 			gpu_name = torch.cuda.get_device_name(0)

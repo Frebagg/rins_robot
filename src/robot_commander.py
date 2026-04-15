@@ -66,10 +66,8 @@ class RobotCommander(Node):
         self.feedback = None
         self.status = None
         self.initial_pose_received = False
-        self.is_docked = None
 
         # ROS2 subscribers
-        self.create_subscription(DockStatus, 'dock_status', self._dockCallback, qos_profile_sensor_data)
         self.localization_pose_sub = self.create_subscription(PoseWithCovarianceStamped, 'amcl_pose', self._amclPoseCallback, amcl_pose_qos)
 
         #-----------------------------------------------------------------------------------------
@@ -89,9 +87,6 @@ class RobotCommander(Node):
         # ROS2 Action clients
         self.nav_to_pose_client = ActionClient(self, NavigateToPose, 'navigate_to_pose')
         self.spin_client = ActionClient(self, Spin, 'spin')
-        self.undock_action_client = ActionClient(self, Undock, 'undock')
-        self.dock_action_client = ActionClient(self, Dock, 'dock')
-
         self.get_logger().info(f"NEW Robot commander has been initialized!")
         
     def destroyNode(self):
@@ -143,51 +138,6 @@ class RobotCommander(Node):
         self.result_future = self.goal_handle.get_result_async()
         return True
     
-    def undock(self):
-        """Perform Undock action."""
-        self.info('Undocking...')
-        self.undock_send_goal()
-
-        while not self.isUndockComplete():
-            time.sleep(0.1)
-
-    def undock_send_goal(self):
-        goal_msg = Undock.Goal()
-        self.undock_action_client.wait_for_server()
-        goal_future = self.undock_action_client.send_goal_async(goal_msg)
-
-        rclpy.spin_until_future_complete(self, goal_future)
-
-        self.undock_goal_handle = goal_future.result()
-
-        if not self.undock_goal_handle.accepted:
-            self.error('Undock goal rejected')
-            return
-
-        self.undock_result_future = self.undock_goal_handle.get_result_async()
-
-    def isUndockComplete(self):
-        """
-        Get status of Undock action.
-
-        :return: ``True`` if undocked, ``False`` otherwise.
-        """
-        if self.undock_result_future is None or not self.undock_result_future:
-            return True
-
-        rclpy.spin_until_future_complete(self, self.undock_result_future, timeout_sec=0.1)
-
-        if self.undock_result_future.result():
-            self.undock_status = self.undock_result_future.result().status
-            if self.undock_status != GoalStatus.STATUS_SUCCEEDED:
-                self.info(f'Goal with failed with status code: {self.status}')
-                return True
-        else:
-            return False
-
-        self.info('Undock succeeded')
-        return True
-
     def cancelTask(self):
         """Cancel pending task request of any type."""
         self.info('Canceling current task.')
@@ -276,9 +226,6 @@ class RobotCommander(Node):
         self.feedback = msg.feedback
         return
     
-    def _dockCallback(self, msg: DockStatus):
-        self.is_docked = msg.is_docked
-
     def setInitialPose(self, pose):
         msg = PoseWithCovarianceStamped()
         msg.pose.pose = pose
@@ -426,14 +373,6 @@ def main(args=None):
 
     # Wait until Nav2 and Localizer are available
     rc.waitUntilNav2Active()
-
-    # Check if the robot is docked, only continue when a message is recieved
-    while rc.is_docked is None:
-        rclpy.spin_once(rc, timeout_sec=0.5)
-
-    # If it is docked, undock it first
-    if rc.is_docked:
-        rc.undock()
     
     # "yaw" == 0 : gor
     # "yaw" == 1 : desno
@@ -444,28 +383,29 @@ def main(args=None):
     # "yaw" == 6 : gor-levo
     # "yaw" == 7 : dol-levo
     
-    koordinate = [
-        (0, 0.0, 0.0, 1),
-        (1, 1.3, 1.8, 4),
-        (2, 0.5, 2.75, 1),
-        (3, -1.5, 2.5, 0),
-        (3, -1.5, 2.5, 7),
-        (4, -2.6, 2.75, 4),
-        (4.5, -2.5, 0.4, 0),
-        (5, -1.9, -0.45, 3),
-        (6, -1.85, -1.3, 3),
-        (6, -1.85, -1.3, 2),
-        (6.5, -1.2, -1.3, 1),
-        (6.5, -1.2, -2.5, 0),
-        (7, 0.0, -1.6, 3),
-        (7.5, 0.6, -3.8, 0),
-        (8, 1.4, -2.5, 2),
-        (8, 1.4, -2.5, 1),
-        (9, 2.55, -1.3, 2),
-        (10, 1.0, 0.3, 1),
-        (10.5, -0.4, 1.2, 2),
-        (11, -1.75, -0.3, 3)
-    ]
+    #koordinate = [
+    #    (0, 0.0, 0.0, 1),
+    #    (1, 1.3, 1.8, 4),
+    #    (2, 0.5, 2.75, 1),
+    #    (3, -1.5, 2.5, 0),
+    #    (3, -1.5, 2.5, 7),
+    #    (4, -2.6, 2.75, 4),
+    #    (4.5, -2.5, 0.4, 0),
+    #    (5, -1.9, -0.45, 3),
+    #    (6, -1.85, -1.3, 3),
+    #    (6, -1.85, -1.3, 2),
+    #    (6.5, -1.2, -1.3, 1),
+    #    (6.5, -1.2, -2.5, 0),
+    #    (7, 0.0, -1.6, 3),
+    #    (7.5, 0.6, -3.8, 0),
+    #    (8, 1.4, -2.5, 2),
+    #    (8, 1.4, -2.5, 1),
+    #    (9, 2.55, -1.3, 2),
+    #    (10, 1.0, 0.3, 1),
+    #    (10.5, -0.4, 1.2, 2),
+    #    (11, -1.75, -0.3, 3)
+    #]
+    koordinate = [ (-1.2, -1.2, -0.2, 2) ]
     
     #---------------------------------------------------------------------
     #PRVI KROG - DETEKCIJE
