@@ -4,7 +4,7 @@ import rclpy
 from rclpy.node import Node
 from rclpy.qos import qos_profile_sensor_data, QoSReliabilityPolicy
 
-from sensor_msgs.msg import Image, PointCloud2
+from sensor_msgs.msg import Image, PointCloud2, CameraInfo
 from sensor_msgs_py import point_cloud2 as pc2
 
 from visualization_msgs.msg import Marker
@@ -55,7 +55,8 @@ class detect_faces(Node):
 		self.tf_listener = TransformListener(self.tf_buffer, self)
 
 		self.rgb_image_sub = self.create_subscription(Image, "/gemini/color/image_raw", self.yolo_callback, qos_profile_sensor_data)
-		self.pointcloud_sub = self.create_subscription(PointCloud2, "/gemini/depth/points", self.checkFace_callback, qos_profile_sensor_data)
+		self.depth_sub = self.create_subscription(Image, "/gemini/depth/image_raw", self.depth_callback, qos_profile_sensor_data)
+		self.cameraInfo_sub = self.create_subscription(CameraInfo, "/gemini/color/camera_info",self.cameraInfo_callback,10)
 		self.model = YOLO("yolov8n.pt")
 		if torch.cuda.is_available() and self.device != 'cpu':
 			gpu_name = torch.cuda.get_device_name(0)
@@ -72,9 +73,9 @@ class detect_faces(Node):
 		self.coords = [] #tukaj notri so (id, Point(), stevilo detekcij, cas_zadnje_detekcije)
 		self.pendingCoords = [] # kandidati pred potrditvijo: (Point(), stevilo_detekcij, cas_zadnje_detekcije)
 		self.nextFaceId = 1
-		self.COUNTTHRESHOLD = 10
-		self.CONFIDENCETHRESHOLD = 0.7
-		self.MATCH_XY_THRESHOLD = 1.2
+		self.COUNTTHRESHOLD = 7 # prej bil 10 !
+		self.CONFIDENCETHRESHOLD = 0.47 # prej bil 0.7 !
+		self.MATCH_XY_THRESHOLD = 1.  #prej 1.2
 		self.MATCH_Z_THRESHOLD = 1.2
 		self.PENDING_XY_THRESHOLD = 0.9
 		self.PENDING_Z_THRESHOLD = 1.0
@@ -84,15 +85,46 @@ class detect_faces(Node):
 		self.KEEPTIME = int(8e9)
 		self.counter= 0 #za določanje kdaj se sprozi cleanFaceList
 		#---------------------------------------------------------------------------------
+
+		self.depth_image = None
+		self.depth_stamp = None
+		self.depth_frame = None
+		self.fx = None
+		self.fy = None
+		self.cx0 = None
+		self.cy0 = None
+
 		
 
 		self.get_logger().info(f"Face detection node initialized!")
+
+	def printPendingCoords(self):
+		if len(self.pendingCoords) > 0:
+			self.get_logger().info("PendingCOORDS:")
+			for x in self.pendingCoords:
+				self.get_logger().info(f"DetNum: {x[1]}, lastDet: {x[2]}")
+
+	def depth_callback(self,data):
+		try:
+			depth = self.bridge.imgmsg_to_cv2(data,desired_encoding="passthrough")
+			self.depth_image = depth
+			self.depth_stamp = data.header.stamp
+			self.depth_frame = data.header.frame_id
+		except CvBridgeError as e:
+			self.get_logger().error(str(e))
+
+
+	def cameraInfo_callback(self,data):
+		self.fx = data.k[0]
+		self.fy = data.k[4]
+		self.cx0 = data.k[2]
+		self.cy0 = data.k[5]
 
 	def yolo_callback(self, data):
 
 		try:
 			cvImage = self.bridge.imgmsg_to_cv2(data, "bgr8")
-			self.get_logger().debug(f"Running inference on image...")
+			#self.get_logger().debug(f"Running inference on image...")
 			res = self.model.predict(cvImage, imgsz=(256, 320), show=False, verbose=False, classes=[0], device=self.device)
 			if len(res) == 0:
 				return
@@ -106,6 +138,9 @@ class detect_faces(Node):
 			bestConf = 0.0
 			for i in range(len(boxes)): #cez vse skatle
 				confidence = float(boxes.conf[i])
+
+				#self.get_logger().info(f"Detected face with confidence {confidence}!")
+
 				if confidence > self.CONFIDENCETHRESHOLD: #obravnavas le ce je confidence zadosten
 					vertices = boxes.xyxy[i]
 					cx = int(((vertices[0]+vertices[2])/2))
@@ -120,6 +155,7 @@ class detect_faces(Node):
 			if bestBbox != None:
 				cvImage = cv2.rectangle(cvImage, (int(bestBbox[0]), int(bestBbox[1])), (int(bestBbox[2]), int(bestBbox[3])), self.detection_color, 3)
 				cvImage = cv2.circle(cvImage, bestCenter, 5, self.detection_color, -1)
+				self.get_logger().info(f"Depth at face: {self.depth_image[cy, cx]}")
 
 			cv2.imshow("image",cvImage)
 
@@ -128,28 +164,62 @@ class detect_faces(Node):
 				print("exiting")
 				exit()
 			
+			self.checkFace_callback()
 		except CvBridgeError as e:
 			print(e)
 
-	def checkFace_callback(self, data):
 
-		height = data.height
+
+	def checkFace_callback(self):
+		
+		#self.get_logger().info(f"checkFace_callback START, Length of faces: {len(self.faces)}")
+
+		"""height = data.height
 		width = data.width
+
+		self.get_logger().info(f"Data is {height}x{width}")
+
 		sourceFrame = data.header.frame_id
 		sourceStamp = data.header.stamp
 		# get 3-channel representation of the point cloud in numpy format once per callback
 		a = pc2.read_points_numpy(data, field_names=("x", "y", "z"))
-		a = a.reshape((height, width, 3))
+		a = a.reshape((height, width, 3))"""
 
-	
+		if self.depth_image is None: 
+			return
+		
+		height, width = self.depth_image.shape
+		sourceFrame = self.depth_frame
+		sourceStamp = self.depth_stamp
+
 		now = self.get_clock().now()
 
 		for cx, cy, conf in self.faces:
+
+			self.get_logger().info(f"cx: {cx}, cy: {cy}, conf: {conf}")
+
 			if cx < 0 or cy < 0 or cx >= width or cy >= height: #ce je center neustrezen
+
+				self.get_logger().info("checkFace neustrezen center")
+
 				continue
-			d = a[cy,cx,:]
+			
+			"""d = a[cy,cx,:]
 			if np.isnan(d).any(): #ce kaksen NaN continue
+
+				self.get_logger().info("checkFace notri NaN")
+
+				continue"""
+
+			window = self.depth_image[cy-2:cy+3, cx-2:cx+3]
+			depth = np.nanmedian(window)
+			if depth == 0 or np.isnan(depth):
 				continue
+			Z = float(depth) / 1000.0
+			X = (cx - self.cx0) * Z / self.fx
+			Y = (cy - self.cy0) * Z / self.fy
+			d = np.array([X,Y,Z])
+
 			detection = self.baseLink2Map(d, sourceFrame, sourceStamp) #map koordinate
 				
 			if not (detection is None):
@@ -171,7 +241,8 @@ class detect_faces(Node):
 			self.cleanFaceList()
 		self.counter += 1"""
 		self.faces.clear() #ko obdelas vse detekcije sprazni list, drugace memleak
-		self.get_logger().debug(f"Tracked faces: {len(self.coords)}, pending: {len(self.pendingCoords)}")		
+		self.get_logger().info(f"Tracked faces: {len(self.coords)}, pending: {len(self.pendingCoords)}")
+		#self.printPendingCoords()		
 
 	def xyDist(self, ax, ay, bx, by): #vrne evklidsko razdaljo med tockama
 		dx = ax - bx
@@ -180,6 +251,9 @@ class detect_faces(Node):
 
 	#primerja detekcijo z vsemi "ziher" obrazi do zdaj
 	def updateConfirmed(self, x, y, z, now): 
+
+		#self.get_logger().info("updateConfirmed START")
+
 		bestIdx = -1
 		bestXyDist = float('inf')
 		for i, (faceId, face, count, lastSeen) in enumerate(self.coords):
@@ -191,6 +265,9 @@ class detect_faces(Node):
 				bestIdx = i
 
 		if bestIdx < 0:
+
+			#self.get_logger().info("updateConfirmed returned False")
+
 			return False
 
 		#povpreci koordinate ce je ta obraz ze bil viden
@@ -199,10 +276,16 @@ class detect_faces(Node):
 		face.y = (y + face.y) / 2.0
 		face.z = (z + face.z) / 2.0
 		self.coords[bestIdx] = (faceId, face, count + 1, now)
+
+		#self.get_logger().info("updateConfirmed returned TRUE")
+
 		return True
 
 	#posodablja drugi vmesni seznam 
 	def updatePending(self, x, y, z, now):
+
+		#self.get_logger().info("updatePending")
+
 		bestIdx = -1
 		bestXyDist = float('inf')
 		for i, (face, count, lastSeen) in enumerate(self.pendingCoords):
@@ -213,6 +296,9 @@ class detect_faces(Node):
 				bestIdx = i
 
 		if bestIdx >= 0:
+
+			#self.get_logger().info("povprecim v updatePending (ze imam enega notri)")
+
 			face, count, _ = self.pendingCoords[bestIdx]
 			face.x = (x + face.x) / 2.0
 			face.y = (y + face.y) / 2.0
@@ -230,6 +316,9 @@ class detect_faces(Node):
 		p.x = float(x)
 		p.y = float(y)
 		p.z = float(z)
+	
+		#self.get_logger().info("Added a new face to pendingCoords!")
+
 		self.pendingCoords.append((p, 1, now))
 
 	def removePending(self, now):
