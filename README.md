@@ -18,7 +18,6 @@ ne vem ce so cist usi te koraki na enkrat obvezni ampak runna se z vsemi na enkr
 3. ros2 launch turtlebot4_viz view_navigation.launch.py
 
 za rocno upravlja18e:
-ros2 param set /global_costmap/global_costmap inflation_layer.cost_scaling_factor 18.0
 4. ros2 run teleop_twist_keyboard teleop_twist_keyboard --ros-args -p stamped:=true
 
 
