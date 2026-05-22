@@ -17,8 +17,21 @@ ne vem ce so cist usi te koraki na enkrat obvezni ampak runna se z vsemi na enkr
 2. ros2 launch turtlebot4_navigation nav2.launch.py
 3. ros2 launch turtlebot4_viz view_navigation.launch.py
 
-za rocno upravljanje:
+za rocno upravlja18e:
+ros2 param set /global_costmap/global_costmap inflation_layer.cost_scaling_factor 18.0
 4. ros2 run teleop_twist_keyboard teleop_twist_keyboard --ros-args -p stamped:=true
+
+
+
+
+ros2 param set /local_costmap/local_costmap inflation_layer.inflation_radius 0.25
+ros2 param set /global_costmap/global_costmap inflation_layer.inflation_radius 0.25
+ros2 param set /local_costmap/local_costmap inflation_layer.cost_scaling_factor 18.0
+ros2 param set /global_costmap/global_costmap inflation_layer.cost_scaling_factor 18.0
+
+ros2 param set /local_costmap/local_costmap footprint "[[0.16, 0.00], [0.113, -0.113], [0.00, -0.16], [-0.113, -0.113], [-0.16, 0.00], [-0.113, 0.113], [0.00, 0.16], [0.113, 0.113]]"
+
+ros2 param set /global_costmap/global_costmap footprint "[[0.16, 0.00], [0.113, -0.113], [0.00, -0.16], [-0.113, -0.113], [-0.16, 0.00], [-0.113, 0.113], [0.00, 0.16], [0.113, 0.113]]"
 
 
 ## NOV MODEL ZA FACE DETECTION!!!!
