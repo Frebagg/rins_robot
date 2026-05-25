@@ -1,16 +1,4 @@
 #!/usr/bin/env python3
-"""Train the custom cylinder YOLO segmentation model.
-
-Example:
-python3 tools/train_cylinder_yolo.py \
-  --data ~/ris/ros_ws/src/rins_robot/config/cylinder_dataset.yaml \
-  --model yolo11s-seg.pt \
-  --epochs 80 \
-  --imgsz 640 \
-  --batch 8 \
-  --device 0
-"""
-
 import argparse
 
 

@@ -1,11 +1,5 @@
 #!/usr/bin/env python3
-"""YOLO segmentation based cylinder detector for the RINS TurtleBot4 project.
-
-Expected custom model classes:
-  0: cylinder_upright
-  1: cylinder_lying
-  2: liquid_puddle
-
+"""
 Pipeline:
   RGB image -> YOLO instance segmentation -> color classification from mask
   -> leaking check for lying cylinders -> depth + camera_info 3D point

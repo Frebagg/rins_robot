@@ -1,12 +1,4 @@
 #!/usr/bin/env python3
-"""Save RGB frames for building a YOLO cylinder dataset.
-
-Controls when preview is enabled:
-  s = save one frame
-  q = quit preview window
-
-Use autosave with parameter save_every_sec > 0 if you want unattended capture while driving.
-"""
 
 import os
 import time
