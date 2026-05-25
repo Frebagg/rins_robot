@@ -1,6 +1,7 @@
-install
-log
-build
+# ROS/colcon workspace outputs
+/build/
+/install/
+/log/
 
 # Byte-compiled / optimized / DLL files
 __pycache__/
@@ -209,3 +210,20 @@ cython_debug/
 marimo/_static/
 marimo/_lsp/
 __marimo__/
+# Project-local runtime/editor noise
+/.agents/
+/.codex/
+/.ros/
+
+# YOLO training data and generated training outputs are not needed at runtime.
+# Keep final runtime models under models/ so a fresh pull can launch detection.
+/datasets/cylinder_yolo/
+/runs/
+/runs*/
+
+# Downloaded base/checkpoint weights in the repository root.
+# Put committed runtime models in models/ instead.
+/yolo*.pt
+/yolov*.pt
+!/models/
+!/models/*.pt

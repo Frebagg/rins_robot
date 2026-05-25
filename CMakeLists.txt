@@ -23,6 +23,8 @@ install(DIRECTORY
   worlds
   maps
   urdf
+  models
+  docs
   DESTINATION share/${PROJECT_NAME}/
 )
 
@@ -30,9 +32,11 @@ install(PROGRAMS
   src/face_detection.py
   src/ring_detector.py
   src/cylinder_detection.py
+  src/capture_cylinder_dataset.py
   src/visualiser.py
   src/speech_servicer.py
   src/robot_commander.py
+  tools/train_cylinder_yolo.py
   DESTINATION lib/${PROJECT_NAME}
 )
 
