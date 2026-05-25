@@ -36,6 +36,7 @@ install(PROGRAMS
   src/visualiser.py
   src/speech_servicer.py
   src/robot_commander.py
+  src/line_follower.py
   tools/train_cylinder_yolo.py
   DESTINATION lib/${PROJECT_NAME}
 )
