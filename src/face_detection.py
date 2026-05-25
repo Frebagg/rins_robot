@@ -22,6 +22,9 @@ from rins_robot.msg import FaceCoords
 from geometry_msgs.msg import Point
 import time
 
+from rins_robot.srv import BoundingBox
+from rins_robot.srv import FaceRecognition
+
 
 from ultralytics import YOLO
 import torch
@@ -65,6 +68,14 @@ class detect_faces(Node):
 
 		self.coordPublisher = self.create_publisher(FaceCoords, "/face_coords", 10)
 		self.publishTimer = self.create_timer(1/5,self.publishFaces_callback)
+
+		#---------------------------------------------------------------------------------
+		#SPREMENLJIVKE ZA PREPOZNAVANJE OSEB
+		self.requestClassification = self.create_service(BoundingBox,"/bounding_box_service",self.sendBoundingBox)
+		self.classificationClient = self.create_client(FaceRecognition,"/classify_face")
+		self.pendingBBox = None
+		self.currentBBox = None
+		#---------------------------------------------------------------------------------
 
 		#---------------------------------------------------------------------------------
 		#SPREMENLJIVKE ZA ZAZNAVANJE OBRAZOV
@@ -114,6 +125,9 @@ class detect_faces(Node):
 					if confidence > bestConf:	
 						bestConf = confidence
 						bestBbox = vertices
+
+						self.pendingBBox = vertices #kandidat za bbox
+						
 						bestCenter = (cx, cy)
 					
 			#VIZUALIZACIJA NAJBOLJSE DETEKCIJE
@@ -199,6 +213,9 @@ class detect_faces(Node):
 		face.y = (y + face.y) / 2.0
 		face.z = (z + face.z) / 2.0
 		self.coords[bestIdx] = (faceId, face, count + 1, now)
+
+		self.currentBBox = self.pendingBBox #za posiljanje naprej
+
 		return True
 
 	#posodablja drugi vmesni seznam 
@@ -222,6 +239,7 @@ class detect_faces(Node):
 			#ce je obraz zaznan dovoljkrat potem se ga premakne v self.coords (real obrazi)
 			if count >= self.MINHITS:
 				self.coords.append((self.nextFaceId, face, count, now))
+				self.currentBBox = self.pendingBBox
 				self.nextFaceId += 1
 				del self.pendingCoords[bestIdx]
 			return
@@ -319,6 +337,32 @@ class detect_faces(Node):
 				pub.ids.append(faceId)
 				pub.points.append(face)
 		self.coordPublisher.publish(pub)
+
+	def sendBoundingBox(self,req,res):
+		if self.currentBBox is not None:
+			request = FaceRecognition.Request()
+			try:
+				request.bbox = [int(float(v)) for v in self.currentBBox]
+			except Exception:
+				request.bbox = list(self.currentBBox)
+
+			future = self.classificationClient.call_async(request)
+			rclpy.spin_until_future_complete(self, future)
+			response = future.result()
+			if response is not None:
+				self.get_logger().info("Received classification from face_classifier!")
+				res.person = response.person
+				res.gender = response.gender
+			else:
+				self.get_logger().info("DID NOT receive classification from face_classifier!")
+				res.person = "NONE"
+				res.gender = "NONE"
+			return res
+		else:
+			self.get_logger().info("Could not send BBox, there is none!")
+			res.person = "NONE"
+			res.gender = "NONE"
+			return res
 
 
 def main():
