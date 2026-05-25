@@ -118,14 +118,16 @@ class RingDetector(Node):
 
         sensor_qos = qos_profile_sensor_data
 
+        # Gazebo (OAK-D): 'oakd/rgb/preview/...'
+        # Real robot (Gemini): '/gemini/...'
         self.info_sub = self.create_subscription(
-            CameraInfo, '/gemini/depth/camera_info',
+            CameraInfo, 'oakd/rgb/preview/camera_info',
             self._camera_info_cb, sensor_qos)
 
         self._rgb_sub   = message_filters.Subscriber(
-            self, Image, '/gemini/color/image_raw',  qos_profile=sensor_qos)
+            self, Image, 'oakd/rgb/preview/image_raw',  qos_profile=sensor_qos)
         self._depth_sub = message_filters.Subscriber(
-            self, Image, '/gemini/depth/image_raw',  qos_profile=sensor_qos)
+            self, Image, 'oakd/rgb/preview/depth',  qos_profile=sensor_qos)
         self._sync = message_filters.ApproximateTimeSynchronizer(
             [self._rgb_sub, self._depth_sub],
             queue_size=SYNC_QUEUE, slop=SYNC_SLOP_S)
@@ -184,15 +186,21 @@ class RingDetector(Node):
         self._rej_stats['frames'] += 1
 
         try:
-            rgb   = self.bridge.imgmsg_to_cv2(rgb_msg,   'bgr8')
+            rgb       = self.bridge.imgmsg_to_cv2(rgb_msg,   'bgr8')
             depth_raw = self.bridge.imgmsg_to_cv2(depth_msg, 'passthrough')
         except CvBridgeError as e:
             self.get_logger().error(f'CvBridge: {e}')
             return
 
-        depth_raw = cv2.medianBlur(depth_raw, 5)
+        # Gemini (real robot) sends uint16 in mm; Gazebo OAK-D sends 32FC1 in metres.
+        if depth_msg.encoding in ('16UC1', 'mono16'):
+            depth_raw = cv2.medianBlur(depth_raw, 5)
+            depth_m = depth_raw.astype(np.float32) / 1000.0
+        else:
+            # float32 metres — medianBlur only supports ksize=3 for float32
+            depth_m = depth_raw.astype(np.float32)
+            depth_m = cv2.medianBlur(depth_m, 3)
 
-        depth_m = depth_raw.astype(np.float32) / 1000.0
         depth_m[~np.isfinite(depth_m)] = 0.0
 
         depth_m[depth_m > DEPTH_MAX_M] = 0.0
