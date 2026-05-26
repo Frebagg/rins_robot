@@ -16,7 +16,11 @@ Nudi 2 servica:
 run z:
 1. ros2 run rmw_zenoh_cpp rmw_zenohd
 2. ros2 launch rins_robot sim_turtlebot_nav.launch.py
-3. ros2 run rins_robot arm_mover_actions.py
+
+ros2 launch rins_robot cylinder_detection_yolo.launch.py device:=0 confidence_threshold:=0.85 max_fps:=8.0
+
+
+ros2 run rins_robot arm_mover_actions.py
 -spremembe z ros2 topic pub --once /arm_command std_msgs/msg/String "{data: look_at_belt_right}"
 -izbira med:
     -look_at_belt_right
@@ -25,5 +29,5 @@ run z:
     -garage
     -up
     (-manual)
-4. ros2 run rqt_image_view rqt_image_view /top_camera/rgb/preview/image_raw
+ros2 run rqt_image_view rqt_image_view /top_camera/rgb/preview/image_raw
 -kamera na roki

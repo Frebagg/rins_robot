@@ -1,0 +1,8 @@
+path: datasets/cylinder_yolo
+train: images/train
+val: images/val
+
+names:
+  0: cylinder_upright
+  1: cylinder_lying
+  2: liquid_puddle
