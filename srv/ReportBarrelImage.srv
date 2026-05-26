@@ -1,0 +1,4 @@
+int32 barrel_id
+sensor_msgs/Image image
+---
+bool success
