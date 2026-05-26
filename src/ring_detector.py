@@ -205,7 +205,7 @@ class RingDetector(Node):
                 continue
 
             # Transformiramo točko iz camera frame v map frame
-            point_map = self.camera_to_map(point_3d)
+            point_map = self.camera_to_map(point_3d, data.header)
             if point_map is None:
                 continue
 
@@ -332,14 +332,14 @@ class RingDetector(Node):
         median_pt = np.median(pts, axis=0)
         return median_pt if np.isfinite(median_pt).all() else None
 
-    def camera_to_map(self, point_3d):
+    def camera_to_map(self, point_3d, header):
         """
-        Transformira točko iz 'oakd_rgb_camera_optical_frame' v 'map' frame z TF.
+        Transformira točko iz frame-a pointclouda v 'map' frame z TF.
         Vrne PointStamped v map frame ali None če transformacija ni na voljo.
         """
         p = PointStamped()
-        p.header.frame_id = "oakd_rgb_camera_optical_frame"
-        p.header.stamp    = self.get_clock().now().to_msg()
+        p.header.frame_id = header.frame_id
+        p.header.stamp    = header.stamp
         p.point.x = float(point_3d[0])
         p.point.y = float(point_3d[1])
         p.point.z = float(point_3d[2])
@@ -347,13 +347,21 @@ class RingDetector(Node):
         try:
             transform = self.tf_buffer.lookup_transform(
                 "map", p.header.frame_id,
-                rclpy.time.Time(),
+                rclpy.time.Time.from_msg(p.header.stamp),
                 timeout=Duration(seconds=0.2)
             )
             return tfg.do_transform_point(p, transform)
         except Exception as e:
-            self.get_logger().warn(f"TF transformacija neuspešna: {e}")
-            return None
+            try:
+                transform = self.tf_buffer.lookup_transform(
+                    "map", p.header.frame_id,
+                    rclpy.time.Time(),
+                    timeout=Duration(seconds=0.2)
+                )
+                return tfg.do_transform_point(p, transform)
+            except Exception:
+                self.get_logger().warn(f"TF transformacija neuspešna: {e}")
+                return None
 
     def make_ring_mask(self, shape, ellipse):
         """

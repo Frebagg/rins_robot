@@ -15,11 +15,12 @@
 
 
 from enum import Enum
+import math
 import time
 
 from action_msgs.msg import GoalStatus
 from builtin_interfaces.msg import Duration
-from geometry_msgs.msg import Quaternion, PoseStamped, PoseWithCovarianceStamped
+from geometry_msgs.msg import Quaternion, PoseStamped, PoseWithCovarianceStamped, TwistStamped
 from lifecycle_msgs.srv import GetState
 from nav2_msgs.action import Spin, NavigateToPose
 from turtle_tf2_py.turtle_tf2_broadcaster import quaternion_from_euler
@@ -34,10 +35,11 @@ from rclpy.node import Node
 from rclpy.qos import QoSDurabilityPolicy, QoSHistoryPolicy
 from rclpy.qos import QoSProfile, QoSReliabilityPolicy
 from rclpy.qos import qos_profile_sensor_data
+from std_msgs.msg import String
 
 #ZA DRUGI KROG
+from rins_robot.msg import CylinderCoords
 from rins_robot.msg import FaceCoords
-from rins_robot.msg import RingCoords
 from rins_robot.srv import Speech
 import numpy as np
 
@@ -52,6 +54,23 @@ amcl_pose_qos = QoSProfile(
           reliability=QoSReliabilityPolicy.RELIABLE,
           history=QoSHistoryPolicy.KEEP_LAST,
           depth=1)
+
+# Koordinate za anomaly premik.
+# Vpisi kot (x, y). Ce zelis zraven oznako, lahko vpises tudi (id, x, y).
+ANOMALY_RED_COORDINATES = [
+    (1, 0.55, 4.75),
+    (2, -1.75, 4.75)
+]
+
+ANOMALY_GREEN_COORDINATES = [
+    (1, -4.75, -2.7),
+    (2, -4.75, 0.5)
+]
+
+ANOMALY_RED_YAW = 3.14      # dol
+ANOMALY_GREEN_YAW = 1.57    # levo
+ANOMALY_ARM_INSPECT_COMMAND = "look_at_belt_left"
+ANOMALY_ARM_DEFAULT_COMMAND = "up"
 
 class RobotCommander(Node):
 
@@ -74,17 +93,18 @@ class RobotCommander(Node):
 
         #-----------------------------------------------------------------------------------------
         self.create_subscription(FaceCoords,"/face_coords",self.updateFaceCoords,10)
-        self.create_subscription(RingCoords,"/ring_coords",self.updateRingCoords,10)
+        self.create_subscription(CylinderCoords,"/cylinder_coords",self.updateCylinderCoords,10)
 
         self.greetClient = self.create_client(Speech,"/greet_service")
-        self.sayColorClient = self.create_client(Speech,"/sayColor_service")
 
         self.faces = []
-        self.rings = []
+        self.cylinders = []
         #-----------------------------------------------------------------------------------------
         
         # ROS2 publishers
         self.initial_pose_pub = self.create_publisher(PoseWithCovarianceStamped, 'initialpose', 10)
+        self.arm_command_pub = self.create_publisher(String, '/arm_command', 10)
+        self.cmd_vel_pub = self.create_publisher(TwistStamped, '/cmd_vel', 10)
         
         # ROS2 Action clients
         self.nav_to_pose_client = ActionClient(self, NavigateToPose, 'navigate_to_pose')
@@ -288,6 +308,159 @@ class RobotCommander(Node):
         self.initial_pose_pub.publish(msg)
         return
 
+    def _wrap_angle(self, angle):
+        return (angle + math.pi) % (2 * math.pi) - math.pi
+
+    def _angle_diff(self, target, current):
+        return self._wrap_angle(target - current)
+
+    def _clamp(self, value, minimum, maximum):
+        return max(minimum, min(maximum, value))
+
+    def get_robot_yaw(self):
+        q = self.current_pose.pose.orientation
+        siny_cosp = 2.0 * (q.w * q.z + q.x * q.y)
+        cosy_cosp = 1.0 - 2.0 * (q.y * q.y + q.z * q.z)
+        return math.atan2(siny_cosp, cosy_cosp)
+
+    def publishCmdVel(self, linear, angular):
+        msg = TwistStamped()
+        msg.header.stamp = self.get_clock().now().to_msg()
+        msg.twist.linear.x = float(linear)
+        msg.twist.angular.z = float(angular)
+        self.cmd_vel_pub.publish(msg)
+
+    def stopRobot(self):
+        for _ in range(3):
+            self.publishCmdVel(0.0, 0.0)
+            time.sleep(0.05)
+
+    def turnDirectToYaw(self, target_yaw, yaw_tolerance=0.06, max_angular=0.6, timeout=10.0):
+        if not hasattr(self, 'current_pose'):
+            self.warn("Cannot turn directly because current pose is not available.")
+            return False
+
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            rclpy.spin_once(self, timeout_sec=0.05)
+            error = self._angle_diff(target_yaw, self.get_robot_yaw())
+
+            if abs(error) <= yaw_tolerance:
+                self.stopRobot()
+                return True
+
+            angular = self._clamp(1.8 * error, -max_angular, max_angular)
+            self.publishCmdVel(0.0, angular)
+
+        self.stopRobot()
+        self.warn("Direct turn timed out.")
+        return False
+
+    def driveStraightToXY(self, target_x, target_y, distance_tolerance=0.08,
+                          max_linear=0.16, max_angular=0.6, timeout=30.0):
+        if not hasattr(self, 'current_pose'):
+            self.warn("Cannot drive directly because current pose is not available.")
+            return False
+
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            rclpy.spin_once(self, timeout_sec=0.05)
+
+            robot_position = self.get_robot_position()
+            dx = target_x - robot_position[0]
+            dy = target_y - robot_position[1]
+            distance = math.hypot(dx, dy)
+
+            if distance <= distance_tolerance:
+                self.stopRobot()
+                return True
+
+            target_yaw = math.atan2(dy, dx)
+            heading_error = self._angle_diff(target_yaw, self.get_robot_yaw())
+            angular = self._clamp(1.8 * heading_error, -max_angular, max_angular)
+
+            if abs(heading_error) > 0.35:
+                linear = 0.0
+            else:
+                linear = min(max_linear, max(0.04, 0.7 * distance))
+
+            self.publishCmdVel(linear, angular)
+
+        self.stopRobot()
+        self.warn(f"Direct drive to ({target_x:.2f}, {target_y:.2f}) timed out.")
+        return False
+
+    def goDirectToXYYaw(self, x, y, yaw):
+        if not self.driveStraightToXY(x, y):
+            return False
+        return self.turnDirectToYaw(yaw)
+
+    def setArmPosition(self, command, wait_seconds=3.5):
+        msg = String()
+        msg.data = command
+        self.info(f"Setting arm position: {command}")
+        self.arm_command_pub.publish(msg)
+        if wait_seconds > 0:
+            time.sleep(wait_seconds)
+
+    def _build_goal_pose(self, x, y, yaw):
+        goal_pose = PoseStamped()
+        goal_pose.header.frame_id = 'map'
+        goal_pose.header.stamp = self.get_clock().now().to_msg()
+        goal_pose.pose.position.x = x
+        goal_pose.pose.position.y = y
+        goal_pose.pose.orientation = self.YawToQuaternion(yaw)
+        return goal_pose
+
+    def goToXYYaw(self, x, y, yaw):
+        goal_pose = self._build_goal_pose(x, y, yaw)
+        if not self.goToPose(goal_pose):
+            return False
+
+        self.info("Waiting for the task to complete...")
+        while not self.isTaskComplete():
+            time.sleep(1)
+
+        return self.getResult() == TaskResult.SUCCEEDED
+
+    def _anomaly_point_to_xy(self, point):
+        if len(point) == 2:
+            return point[0], point[1]
+        if len(point) >= 3:
+            return point[1], point[2]
+        raise ValueError("Anomaly coordinate must be (x, y) or (id, x, y).")
+
+    def runAnomalyMovement(self, coordinates, yaw, label="anomaly"):
+        if len(coordinates) < 2:
+            self.warn(f"Need at least two coordinates for {label} movement.")
+            return False
+
+        first_x, first_y = self._anomaly_point_to_xy(coordinates[0])
+        second_x, second_y = self._anomaly_point_to_xy(coordinates[1])
+
+        self.info(f"Starting {label} movement.")
+        if not self.goDirectToXYYaw(first_x, first_y, yaw):
+            self.warn(f"Could not reach first {label} coordinate.")
+            return False
+
+        self.setArmPosition(ANOMALY_ARM_INSPECT_COMMAND)
+
+        success = self.goDirectToXYYaw(second_x, second_y, yaw)
+        self.setArmPosition(ANOMALY_ARM_DEFAULT_COMMAND)
+
+        if not success:
+            self.warn(f"Could not reach second {label} coordinate.")
+            return False
+
+        self.info(f"Finished {label} movement.")
+        return True
+
+    def runRedAnomalyMovement(self):
+        return self.runAnomalyMovement(ANOMALY_RED_COORDINATES, ANOMALY_RED_YAW, "red anomaly")
+
+    def runGreenAnomalyMovement(self):
+        return self.runAnomalyMovement(ANOMALY_GREEN_COORDINATES, ANOMALY_GREEN_YAW, "green anomaly")
+
     def info(self, msg):
         self.get_logger().info(msg)
         return
@@ -308,8 +481,14 @@ class RobotCommander(Node):
     def updateFaceCoords(self,data):
         self.faces = list(zip(data.points, data.ids))
 
-    def updateRingCoords(self,data):
-        self.rings = list(zip(data.points, data.ids,data.colors))
+    def updateCylinderCoords(self,data):
+        self.cylinders = list(zip(
+            data.points,
+            data.ids,
+            data.colors,
+            data.orientations,
+            data.leaking
+        ))
 
     def get_robot_position(self):
         return np.array([
@@ -348,7 +527,8 @@ class RobotCommander(Node):
     def _go_close_enough(self, target_x, target_y, standoff_distance=0.30, close_enough_distance=0.60):
         """Navigate to a standoff point and accept failures if we are still close enough."""
         goal_pose = self._build_standoff_goal(target_x, target_y, standoff_distance)
-        self.goToPose(goal_pose)
+        if not self.goToPose(goal_pose):
+            return False
 
         self.info("Waiting for the task to complete...")
         while not self.isTaskComplete():
@@ -377,8 +557,17 @@ class RobotCommander(Node):
         #najprej obrazi
         request = Speech.Request()
         request.data = "Hello, human"
-        ringsCopy = self.rings.copy()
+
+        end_time = time.monotonic() + 1.0
+        while time.monotonic() < end_time:
+            rclpy.spin_once(self, timeout_sec=0.1)
+
         facesCopy = self.faces.copy()
+        lyingCylindersCopy = [
+            cylinder for cylinder in self.cylinders.copy()
+            if str(cylinder[3]).lower() == "lying"
+        ]
+        self.info(f"Going to visit {len(facesCopy)} faces and {len(lyingCylindersCopy)} lying cylinders.")
 
         for point,id in facesCopy:
             self.info(f"Going towards face {id}.")
@@ -398,25 +587,25 @@ class RobotCommander(Node):
             else:
                 self.info("Failed to talk to a human!")
 
-        #obisci ringe
-        for point,id,color in ringsCopy:
-            self.info(f"Going towards ring {id}.")
+        #obisci lezece cilindre
+        for point,id,color,orientation,leaking in lyingCylindersCopy:
+            self.info(f"Going towards lying cylinder {id}.")
             x = point.x
             y = point.y
-            request.data = color
 
-            if not self._go_close_enough(x, y, standoff_distance=0.30, close_enough_distance=0.60):
+            if not self._go_close_enough(x, y, standoff_distance=0.45, close_enough_distance=0.80):
                 continue
-            
-            future = self.sayColorClient.call_async(request)
-            rclpy.spin_until_future_complete(self,future)
-            time.sleep(1)
-            #time.sleep(2.0)
-            response = future.result()
-            if response is not None and response.success == True:
-                self.info("Sucessfuly talked to a ring!")
-            else:
-                self.info("Failed to talk to a ring!")
+
+            if leaking:
+                request.data = "Warning, spill detected"
+                future = self.greetClient.call_async(request)
+                rclpy.spin_until_future_complete(self,future)
+                time.sleep(1)
+                response = future.result()
+                if response is not None and response.success == True:
+                    self.info("Successfully warned about a spill!")
+                else:
+                    self.info("Failed to warn about a spill!")
     #--------------------------------------------------------------------------
 
 def main(args=None):
@@ -444,6 +633,7 @@ def main(args=None):
     # "yaw" == 6 : gor-levo
     # "yaw" == 7 : dol-levo
     # "yaw" == 8 : obrat na mestu
+    # "yaw" == 9 : direktno naravnost do tocke brez Nav2 plannerja
     
     koordinate = [
         (1, 0.2, -0.5, 8),
@@ -466,6 +656,11 @@ def main(args=None):
     #---------------------------------------------------------------------
     #PRVI KROG - DETEKCIJE
     for id, x, y, yaw in koordinate: 
+        if yaw == 9:
+            rc.info(f"Driving directly to point {id}: {x} {y}")
+            rc.driveStraightToXY(x, y)
+            continue
+
         goal_pose = PoseStamped()
         goal_pose.header.frame_id = 'map'
         goal_pose.header.stamp = rc.get_clock().now().to_msg()
@@ -513,6 +708,11 @@ def main(args=None):
     #DRUGI KROG - OBISKI DETECTIONOV
     rc.info("Going to visit detections now")
     rc.visitDetections()
+
+    # Za rocni test anomaly premika odkomentiraj eno vrstico:
+    # rc.runRedAnomalyMovement()
+    # rc.runGreenAnomalyMovement()
+
     rc.info("Finishing, give good grade!")
     #-------------------------------------------------------------------
 
