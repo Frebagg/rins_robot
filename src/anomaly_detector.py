@@ -59,6 +59,12 @@ class AnomalyDetectorNode(Node):
             # `center_band_ratio` * frame_width (default: very thin, so it
             # behaves like "any part of the rect crosses the center line").
             ('center_band_ratio',  0.02),
+            # ── crop expansion (optional safety margins; default off) ────────
+            # The warp now fits the tile's true 4-corner polygon directly,
+            # so by default we want a pure tight hug. These knobs exist
+            # only if you want to dial in a small safety margin later.
+            ('edge_dilate_px',   0),
+            ('crop_pad_ratio',   0.0),
             # ── model input geometry (must match training) ───────────────────
             ('target_size', 512),
             # ── output ───────────────────────────────────────────────────────
@@ -73,6 +79,8 @@ class AnomalyDetectorNode(Node):
         self.stable_iou        = float(self.get_parameter('stable_iou').value)
         self.reacquire_misses  = int(self.get_parameter('reacquire_misses').value)
         self.center_band_ratio = float(self.get_parameter('center_band_ratio').value)
+        self.edge_dilate_px    = int(self.get_parameter('edge_dilate_px').value)
+        self.crop_pad_ratio    = float(self.get_parameter('crop_pad_ratio').value)
         self.target_size       = int(self.get_parameter('target_size').value)
         self.save_dir          = str(self.get_parameter('save_dir').value)
 
@@ -179,15 +187,24 @@ class AnomalyDetectorNode(Node):
 
         # Safety net: if Otsu landed in a weird place (very dim or very bright
         # frame), force a low fixed threshold. Background is black, so any
-        # pixel above ~30 is part of a tile.
+        # pixel above ~10 is part of a tile (aggressive — catches dim edge
+        # transition pixels too).
         if cv2.countNonZero(binary) < 0.005 * H * W:
-            _, binary = cv2.threshold(gray, 30, 255, cv2.THRESH_BINARY)
+            _, binary = cv2.threshold(gray, 10, 255, cv2.THRESH_BINARY)
 
         # Clean up: small holes inside the tile (specular spots / defects),
         # tiny noise outside it. Open kills speckle, close fills holes.
         k = cv2.getStructuringElement(cv2.MORPH_RECT, (5, 5))
         binary = cv2.morphologyEx(binary, cv2.MORPH_OPEN,  k, iterations=1)
         binary = cv2.morphologyEx(binary, cv2.MORPH_CLOSE, k, iterations=2)
+
+        # Grow the mask outward so the contour reaches the true tile edge.
+        # Otsu drops the dim transition pixels at the tile boundary, leaving
+        # the contour ~1-3 px inside the actual edge; dilation reclaims that.
+        if self.edge_dilate_px > 0:
+            d = 2 * self.edge_dilate_px + 1
+            dilate_k = cv2.getStructuringElement(cv2.MORPH_RECT, (d, d))
+            binary = cv2.dilate(binary, dilate_k, iterations=1)
 
         # Pad by 1px so tiles touching the frame border still close into
         # contours.
@@ -244,28 +261,102 @@ class AnomalyDetectorNode(Node):
 
         return rot_rect, aabb, best_cnt
 
-    def _warp_tile_upright(self, frame: np.ndarray,
-                           rot_rect: tuple,
-                           contour: Optional[np.ndarray] = None) -> np.ndarray:
+    def _find_tile_quad(self, contour: np.ndarray,
+                        rot_rect: tuple) -> np.ndarray:
         """
-        De-rotate the tile to an upright square at exactly
-        target_size × target_size (matching the training image size).
+        Find 4 corner points that hug the tile's actual outline.
 
-        If `contour` is supplied, pixels outside the tile's true outline are
-        zeroed so the model sees a clean tile-only image (no conveyor bleed).
+        Strategy:
+          1. Try approxPolyDP with a few epsilon values — if the contour
+             simplifies to exactly 4 points, use those (best fit for tiles
+             that are genuine quadrilaterals, perspective-skewed or not).
+          2. Otherwise, pick 4 extreme corners: from the rotated rect's 4
+             corners, find the contour point closest to each. This gives
+             a tight 4-point hug for tiles with rounded/chamfered corners
+             where approxPolyDP would over-simplify.
+
+        Returns a (4, 2) float32 array of corner points, ordered TL, TR,
+        BR, BL.
         """
-        box = cv2.boxPoints(rot_rect)              # 4 corners, float32
-        S   = int(self.target_size)
+        # --- attempt 1: approxPolyDP ---
+        # We accept a 4-point approximation only if it doesn't significantly
+        # under-cover the contour. Rounded-corner tiles will simplify to 4
+        # points but with corner area cut off; we want those to fall through
+        # to the extreme-corners method instead.
+        cnt_area = cv2.contourArea(contour)
+        perimeter = cv2.arcLength(contour, closed=True)
+        for eps_frac in (0.01, 0.015, 0.02, 0.03, 0.04, 0.05):
+            approx = cv2.approxPolyDP(contour, eps_frac * perimeter, closed=True)
+            if len(approx) == 4 and cv2.isContourConvex(approx):
+                approx_area = cv2.contourArea(approx)
+                # Quad must cover ≥97% of the contour's area to be considered
+                # a faithful fit. Less means we're cutting corner curvature.
+                if cnt_area > 0 and approx_area / cnt_area >= 0.97:
+                    quad = approx.reshape(4, 2).astype(np.float32)
+                    return self._order_quad(quad)
 
-        # order box points: tl, tr, br, bl
-        pts = box.astype(np.float32)
+        # --- fallback: extreme corners along the rect's diagonals ---
+        # We want corners that CONTAIN the contour (so the quad's edges
+        # don't cut through curved/rounded corners). For each direction
+        # corresponding to a rect corner, find the contour point that is
+        # FURTHEST in that direction. This naturally handles rounded
+        # corners — the extreme point along the diagonal is past the
+        # corner's curvature.
+        rect_corners = cv2.boxPoints(rot_rect).astype(np.float32)  # (4, 2)
+        center = rect_corners.mean(axis=0)
+        cnt_pts = contour.reshape(-1, 2).astype(np.float32)         # (N, 2)
+
+        chosen = []
+        for rc in rect_corners:
+            direction = rc - center
+            direction /= (np.linalg.norm(direction) + 1e-9)
+            # Project every contour point onto this direction; take the max.
+            projections = (cnt_pts - center) @ direction
+            chosen.append(cnt_pts[int(np.argmax(projections))])
+        quad = np.array(chosen, dtype=np.float32)
+        return self._order_quad(quad)
+
+    @staticmethod
+    def _order_quad(pts: np.ndarray) -> np.ndarray:
+        """
+        Order 4 points as TL, TR, BR, BL using sum/diff of coordinates.
+        TL has smallest x+y, BR largest x+y; TR has smallest x-y, BL largest.
+        """
         s = pts.sum(axis=1)
         d = np.diff(pts, axis=1).reshape(-1)
         tl = pts[np.argmin(s)]
         br = pts[np.argmax(s)]
         tr = pts[np.argmin(d)]
         bl = pts[np.argmax(d)]
-        src = np.array([tl, tr, br, bl], dtype=np.float32)
+        return np.array([tl, tr, br, bl], dtype=np.float32)
+
+    def _warp_tile_upright(self, frame: np.ndarray,
+                           rot_rect: tuple,
+                           contour: Optional[np.ndarray] = None) -> np.ndarray:
+        """
+        Warp the tile to an upright target_size × target_size square.
+
+        Uses the contour's actual 4 corners (via _find_tile_quad), NOT the
+        minAreaRect bounding rectangle. This gives a tight hug on tiles
+        that aren't perfect rectangles (chamfered corners, perspective
+        skew, slight bowing).
+
+        Falls back to the rotated rect's corners only if no contour is given.
+        """
+        S = int(self.target_size)
+
+        if contour is not None:
+            src = self._find_tile_quad(contour, rot_rect)
+        else:
+            box = cv2.boxPoints(rot_rect).astype(np.float32)
+            src = self._order_quad(box)
+
+        # Optional outward expansion along the diagonals from the quad's
+        # centroid. Default crop_pad_ratio=0 → pure tight hug.
+        if self.crop_pad_ratio > 0:
+            centroid = src.mean(axis=0)
+            src = centroid + (src - centroid) * (1.0 + self.crop_pad_ratio)
+
         dst = np.array([[0, 0], [S - 1, 0],
                         [S - 1, S - 1], [0, S - 1]], dtype=np.float32)
 
@@ -274,7 +365,8 @@ class AnomalyDetectorNode(Node):
                                      flags=cv2.INTER_LINEAR)
 
         if contour is not None:
-            # Build a frame-sized contour mask, warp with the same M, then apply.
+            # Mask anything outside the tile's true outline so the model
+            # sees a clean tile-only image (no conveyor bleed at edges).
             H, W = frame.shape[:2]
             cnt_mask = np.zeros((H, W), dtype=np.uint8)
             cv2.drawContours(cnt_mask, [contour], -1, 255, thickness=cv2.FILLED)
