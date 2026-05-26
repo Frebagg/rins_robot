@@ -173,8 +173,8 @@ class FaceDialogueServicer(Node):
         segments, _info = self.whisper_model.transcribe(
             audio_path,
             language="en",
-            vad_filter=False,
-            beam_size=1,
+            vad_filter=True,
+            beam_size=3,
             initial_prompt="""
             Possible commands are:
             inspect the barrels, inspect barrels

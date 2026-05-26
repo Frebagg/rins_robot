@@ -37,7 +37,7 @@ def generate_launch_description():
         DeclareLaunchArgument('device', default_value=''),
         DeclareLaunchArgument('max_fps', default_value='5.0'),
         DeclareLaunchArgument('confidence_threshold', default_value='0.45'),
-        DeclareLaunchArgument('normalize_radius_m', default_value='0.75'),
+        DeclareLaunchArgument('normalize_radius_m', default_value='0.5'),
         DeclareLaunchArgument('tight_duplicate_radius_m', default_value='0.25'),
         DeclareLaunchArgument('pending_min_hits', default_value='3'),
         DeclareLaunchArgument('publish_min_hits', default_value='6'),

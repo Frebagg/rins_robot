@@ -29,13 +29,13 @@ class RingDetector(Node):
 
         # Parametri za veljavnost depth vrednosti
         self.min_valid_depth = 0.05   # bliže od tega je šum [m]
-        self.max_valid_depth = 5.0    # dlje od tega ne zaznamo [m]
+        self.max_valid_depth = 3.0    # dlje od tega ne zaznamo [m]
 
         # Parametri za binarizacijo depth slike
         # Samo piksli v tem razponu globine postanejo beli v binarni sliki.
         # S tem izrežemo ozadje in tla, ki so preveč daleč ali preblizu.
         self.binary_depth_min = 0.5   # [m]
-        self.binary_depth_max = 4.0   # [m]
+        self.binary_depth_max = 3.0   # [m]
 
         # Parametri za validacijo obroča z depth
         # inner_scale: notranja elipsa je inner_scale-krat manjša od zunanje.
@@ -47,13 +47,20 @@ class RingDetector(Node):
         # Parametri za združevanje zaznav v tabelo obročev
         # Če je nova zaznava bliže od teh pragov obstoječemu obroču,
         # jo združimo z njim (povprečenje pozicije) namesto da dodamo novega.
-        self.merge_distance_xy = 0.5
-        self.merge_distance_z  = 0.5
+        self.merge_distance_xy = 0.75
+        self.merge_distance_z  = 0.75
+
+        # Parametri za potrjevanje ringov.
+        # Ring gre na /ring_coords sele, ko je viden v vec frame-ih.
+        self.max_ring_range = 3.0
+        self.pending_min_hits = 3
+        self.pending_keep_time_s = 4.0
 
         # Parametri za stanje
         self.latest_depth = None  # zadnja depth slika (float32, metri)
         self.rings_2d     = []    # zaznave iz trenutnega frame-a: [(ellipse, color, confidence), ...]
         self.coords       = []    # tabela unikatnih obročev: [(id, Point, color_scores, count), ...]
+        self.pending_coords = []  # kandidati pred potrditvijo: [(Point, color_scores, count, last_seen), ...]
         self.next_ring_id = 1     # naraščajoči ID za nove obroče
 
         # ROS infrastruktura
@@ -191,6 +198,8 @@ class RingDetector(Node):
         Sprejme pointcloud in za vsako 2D zaznavo obroča izračuna 3D pozicijo.
         Nato jo transformira v map frame in doda/združi v tabelo obročev.
         """
+        now = self.get_clock().now()
+
         # Pretvorimo PointCloud2 v numpy array oblike (height, width, 3)
         pts = pc2.read_points_numpy(data, field_names=("x", "y", "z"))
         pts = pts.reshape((data.height, data.width, 3))
@@ -202,6 +211,9 @@ class RingDetector(Node):
             # Izračunamo 3D pozicijo obroča iz pointclouda
             point_3d = self.get_ring_3d_point(pts, ellipse)
             if point_3d is None:
+                continue
+
+            if np.linalg.norm(point_3d) > self.max_ring_range:
                 continue
 
             # Transformiramo točko iz camera frame v map frame
@@ -216,34 +228,94 @@ class RingDetector(Node):
 
             self.get_logger().info(f"Nova zaznava: {color} ({color_confidence:.2f})  x={x:.2f} y={y:.2f} z={z:.2f}")
 
-            # Preverimo ali je v blizini ze obstojec obroc. Barva ne vpliva na merge.
-            merged = False
-            for i, (ring_id, ring_pt, color_scores, count) in enumerate(self.coords):
-                xy_dist = float(np.hypot(ring_pt.x - x, ring_pt.y - y))
-                z_dist = abs(ring_pt.z - z)
-                if xy_dist <= self.merge_distance_xy and z_dist <= self.merge_distance_z:
-                    new_count = count + 1
-                    ring_pt.x = (ring_pt.x * count + x) / new_count
-                    ring_pt.y = (ring_pt.y * count + y) / new_count
-                    ring_pt.z = (ring_pt.z * count + z) / new_count
-                    color_scores[color] = color_scores.get(color, 0.0) + max(float(color_confidence), 1e-3)
-                    best_color = self.best_color(color_scores)
-                    self.coords[i] = (ring_id, ring_pt, color_scores, new_count)
-                    self.get_logger().info(f"  → združeno z obročem #{ring_id}, barva={best_color}")
-                    merged = True
-                    break
+            # Najprej posodobimo ze potrjene ringe. Ce se noben ne ujema,
+            # gre zaznava v pending seznam in se potrdi sele po vec zadetkih.
+            if not self.update_confirmed_ring(x, y, z, color, color_confidence):
+                self.update_pending_ring(x, y, z, color, color_confidence, now)
 
-            if not merged:
-                # Dodamo nov obroč v tabelo
-                p = Point()
-                p.x, p.y, p.z = x, y, z
-                color_scores = {color: max(float(color_confidence), 1e-3)}
-                self.coords.append((self.next_ring_id, p, color_scores, 1))
-                self.get_logger().info(f"  → nov obroč #{self.next_ring_id}: {color}")
-                self.next_ring_id += 1
+        self.remove_stale_pending_rings(now)
 
         # Počistimo 2D zaznave — pointcloud_callback jih je že obdelal
         self.rings_2d.clear()
+
+    def xy_distance(self, a, b, x, y):
+        return float(np.hypot(a - x, b - y))
+
+    def add_color_score(self, color_scores, color, color_confidence):
+        color_scores[color] = color_scores.get(color, 0.0) + max(float(color_confidence), 1e-3)
+
+    def update_point_average(self, point, x, y, z, count):
+        new_count = count + 1
+        point.x = (point.x * count + x) / new_count
+        point.y = (point.y * count + y) / new_count
+        point.z = (point.z * count + z) / new_count
+        return new_count
+
+    def update_confirmed_ring(self, x, y, z, color, color_confidence):
+        best_idx = -1
+        best_xy_dist = float('inf')
+
+        for i, (ring_id, ring_pt, color_scores, count) in enumerate(self.coords):
+            xy_dist = self.xy_distance(ring_pt.x, ring_pt.y, x, y)
+            z_dist = abs(ring_pt.z - z)
+            if xy_dist <= self.merge_distance_xy and z_dist <= self.merge_distance_z and xy_dist < best_xy_dist:
+                best_idx = i
+                best_xy_dist = xy_dist
+
+        if best_idx < 0:
+            return False
+
+        ring_id, ring_pt, color_scores, count = self.coords[best_idx]
+        new_count = self.update_point_average(ring_pt, x, y, z, count)
+        self.add_color_score(color_scores, color, color_confidence)
+        self.coords[best_idx] = (ring_id, ring_pt, color_scores, new_count)
+
+        best_color = self.best_color(color_scores)
+        self.get_logger().info(f"  → združeno z obročem #{ring_id}, barva={best_color}, hits={new_count}")
+        return True
+
+    def update_pending_ring(self, x, y, z, color, color_confidence, now):
+        best_idx = -1
+        best_xy_dist = float('inf')
+
+        for i, (ring_pt, color_scores, count, last_seen) in enumerate(self.pending_coords):
+            xy_dist = self.xy_distance(ring_pt.x, ring_pt.y, x, y)
+            z_dist = abs(ring_pt.z - z)
+            if xy_dist <= self.merge_distance_xy and z_dist <= self.merge_distance_z and xy_dist < best_xy_dist:
+                best_idx = i
+                best_xy_dist = xy_dist
+
+        if best_idx >= 0:
+            ring_pt, color_scores, count, _ = self.pending_coords[best_idx]
+            new_count = self.update_point_average(ring_pt, x, y, z, count)
+            self.add_color_score(color_scores, color, color_confidence)
+
+            if new_count >= self.pending_min_hits:
+                self.coords.append((self.next_ring_id, ring_pt, color_scores, new_count))
+                best_color = self.best_color(color_scores)
+                self.get_logger().info(
+                    f"  → potrjen nov obroč #{self.next_ring_id}: {best_color}, hits={new_count}"
+                )
+                self.next_ring_id += 1
+                del self.pending_coords[best_idx]
+            else:
+                self.pending_coords[best_idx] = (ring_pt, color_scores, new_count, now)
+                self.get_logger().info(f"  → pending obroč hits={new_count}/{self.pending_min_hits}")
+            return
+
+        p = Point()
+        p.x, p.y, p.z = float(x), float(y), float(z)
+        color_scores = {color: max(float(color_confidence), 1e-3)}
+        self.pending_coords.append((p, color_scores, 1, now))
+        self.get_logger().info(f"  → nov pending obroč hits=1/{self.pending_min_hits}")
+
+    def remove_stale_pending_rings(self, now):
+        keep = []
+        for ring_pt, color_scores, count, last_seen in self.pending_coords:
+            age_seconds = (now - last_seen).nanoseconds / 1e9
+            if age_seconds <= self.pending_keep_time_s:
+                keep.append((ring_pt, color_scores, count, last_seen))
+        self.pending_coords = keep
 
     def publish_rings_callback(self):
         """Periodično objavlja tabelo vseh znanih obročev na /ring_coords."""

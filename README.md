@@ -73,6 +73,7 @@ ros2 run rins_robot face_dialogue_servicer.py
 ros2 run rins_robot speech_servicer.py
 ros2 run rins_robot ring_detector.py
 ros2 launch rins_robot cylinder_detection_yolo.launch.py device:=0 confidence_threshold:=0.85 max_fps:=8.0
+ros2 run rins_robot visualiser.py
 
 ros2 run rins_robot arm_mover_actions.py
 -spremembe z ros2 topic pub --once /arm_command std_msgs/msg/String "{data: look_at_belt_right}"

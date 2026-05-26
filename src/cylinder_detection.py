@@ -84,7 +84,7 @@ class YoloCylinderDetector(Node):
                 ('device', ''),              # '', 'cpu', '0', ...
                 ('max_fps', 5.0),
                 ('show_debug', True),
-                ('normalize_radius_m', 0.75),
+                ('normalize_radius_m', 0.5),
                 ('tight_duplicate_radius_m', 0.25),
                 ('pending_min_hits', 3),
                 ('publish_min_hits', 6),
