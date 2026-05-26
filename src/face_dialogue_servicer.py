@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 
 import os
+import json
 import re
 import tempfile
 import time
@@ -9,7 +10,10 @@ from collections import defaultdict
 
 import numpy as np
 import rclpy
+from rclpy.callback_groups import ReentrantCallbackGroup
+from rclpy.executors import MultiThreadedExecutor
 from rclpy.node import Node
+from std_msgs.msg import String
 
 try:
     import sounddevice as sd
@@ -29,23 +33,37 @@ class FaceDialogueServicer(Node):
     def __init__(self):
         super().__init__("face_dialogue_servicer")
 
-        self.greet_client = self.create_client(Speech, "/greet_service")
-        self.dialogue_server = self.create_service(FaceDialogue, "/face_dialogue_service", self.handle_dialogue)
+        self.callback_group = ReentrantCallbackGroup()
+
+        self.greet_client = self.create_client(
+            Speech,
+            "/greet_service",
+            callback_group=self.callback_group,
+        )
+        self.dialogue_server = self.create_service(
+            FaceDialogue,
+            "/face_dialogue_service",
+            self.handle_dialogue,
+            callback_group=self.callback_group,
+        )
+        self.task_history_publisher = self.create_publisher(
+            String,
+            "/face_dialogue_task_history",
+            10,
+        )
 
         self.sample_rate = 16000
-        self.utterance_seconds = 3.0
+        self.utterance_seconds = 5.0
         self.max_turns = 8
         self.match_threshold = 0.45
         self.confirm_words = {
             "yes",
             "yeah",
-            "sure",
-            "correct",
-            "yep",
-            "affirmative",
-            "ok",
-            "okay",
+            "yep"
         }
+
+        self.task_history = []
+        self.next_task_id = 1
 
         self.whisper_model = self._load_whisper_model()
 
@@ -57,15 +75,39 @@ class FaceDialogueServicer(Node):
             return None
 
         model_name = os.environ.get("RINS_WHISPER_MODEL", "base.en")
-        device = "cuda" if self._cuda_available() else "cpu"
-        compute_type = "float16" if device == "cuda" else "int8"
+        preferred_device = os.environ.get(
+            "RINS_WHISPER_DEVICE",
+            "cuda" if self._cuda_available() else "cpu"
+        ).strip().lower()
+        requested_compute_type = os.environ.get("RINS_WHISPER_COMPUTE_TYPE")
 
-        try:
-            self.get_logger().info(f"Loading WhisperModel '{model_name}' on {device} ({compute_type})")
-            return WhisperModel(model_name, device=device, compute_type=compute_type)
-        except Exception as exc:
-            self.get_logger().error(f"Could not load WhisperModel: {exc}")
-            return None
+        if requested_compute_type:
+            attempts = [(preferred_device, requested_compute_type.strip().lower())]
+        elif preferred_device == "cuda":
+            attempts = [
+                ("cuda", "float16"),
+                ("cuda", "float32"),
+                ("cpu", "int8"),
+            ]
+        else:
+            attempts = [
+                ("cpu", "int8"),
+                ("cpu", "float32"),
+            ]
+
+        last_error = None
+        for device, compute_type in attempts:
+            try:
+                self.get_logger().info(f"Loading WhisperModel '{model_name}' on {device} ({compute_type})")
+                return WhisperModel(model_name, device=device, compute_type=compute_type)
+            except Exception as exc:
+                last_error = exc
+                self.get_logger().warn(
+                    f"Could not load WhisperModel on {device} ({compute_type}): {exc}"
+                )
+
+        self.get_logger().error(f"Could not load WhisperModel after fallback attempts: {last_error}")
+        return None
 
     def _cuda_available(self):
         try:
@@ -82,8 +124,10 @@ class FaceDialogueServicer(Node):
         request = Speech.Request()
         request.data = text
         future = self.greet_client.call_async(request)
-        rclpy.spin_until_future_complete(self, future)
-        response = future.result()
+        while rclpy.ok() and not future.done():
+            time.sleep(0.01)
+
+        response = future.result() if future.done() else None
         return response is not None and response.success
 
     def say(self, text):
@@ -130,10 +174,10 @@ class FaceDialogueServicer(Node):
             beam_size=3,
             initial_prompt="""
             Possible commands are:
-            inspect barrels,
-            count rings,
-            detect anomalies in the red cell,
-            detect anomalies in the green cell,
+            inspect the barrels, inspect barrels
+            count rings, count the rings,
+            detect anomalies in the red cell, detect the anomalies in the red cell,
+            detect anomalies in the green cell, detect the anomalies in the green cell,
             nothing,
             yes.
             """
@@ -205,6 +249,28 @@ class FaceDialogueServicer(Node):
             return "OK. I will detect the anomalies in the green cell"
         return "OK. I wont do anything"
 
+    def record_task_history(self, name, task, cell):
+        entry = {
+            "id": self.next_task_id,
+            "name": name,
+            "task": task,
+            "cell": cell,
+        }
+        self.next_task_id += 1
+        self.task_history.append(entry)
+
+        message = String()
+        message.data = json.dumps(self.task_history)
+        self.task_history_publisher.publish(message)
+        self.get_logger().info(f"Published task history entry {entry['id']} for name={name}, task={task}, cell={cell}")
+
+    def finish_dialogue(self, res, name, selection):
+        res.task = selection["task"]
+        res.cell = selection["cell"]
+        res.success = True
+        self.record_task_history(name, selection["task"], selection["cell"])
+        return res
+
     def listen_once(self):
         audio = self.record_audio()
         if audio is None:
@@ -224,6 +290,7 @@ class FaceDialogueServicer(Node):
         return self.listen_once()
 
     def handle_dialogue(self, req, res):
+        name = (req.name or "").strip() or "UNKNOWN"
         gender = (req.gender or "M").strip().upper()
         if gender not in {"M", "F"}:
             gender = "M"
@@ -235,10 +302,7 @@ class FaceDialogueServicer(Node):
             selection = self.parse_task(first_reply) or {"task": "nothing", "cell": "none"}
             response_text = self.final_text(selection)
             self.say(response_text)
-            res.task = selection["task"]
-            res.cell = selection["cell"]
-            res.success = True
-            return res
+            return self.finish_dialogue(res, name, selection)
 
         task_counts = defaultdict(int)
         current_selection = None
@@ -260,10 +324,7 @@ class FaceDialogueServicer(Node):
             if task_counts[(selection["task"], selection["cell"])] >= 2:
                 final_response = self.final_text(selection)
                 self.say(final_response)
-                res.task = selection["task"]
-                res.cell = selection["cell"]
-                res.success = True
-                return res
+                return self.finish_dialogue(res, name, selection)
 
             self.say(self.confirmation_text(selection))
 
@@ -276,10 +337,7 @@ class FaceDialogueServicer(Node):
                 if any(word in words for word in self.confirm_words):
                     final_response = self.final_text(current_selection)
                     self.say(final_response)
-                    res.task = current_selection["task"]
-                    res.cell = current_selection["cell"]
-                    res.success = True
-                    return res
+                    return self.finish_dialogue(res, name, current_selection)
 
                 selection = self.parse_task(reply)
                 if selection is None:
@@ -292,10 +350,7 @@ class FaceDialogueServicer(Node):
                 if task_counts[(selection["task"], selection["cell"])] >= 2:
                     final_response = self.final_text(selection)
                     self.say(final_response)
-                    res.task = selection["task"]
-                    res.cell = selection["cell"]
-                    res.success = True
-                    return res
+                    return self.finish_dialogue(res, name, selection)
 
                 self.say(self.confirmation_text(selection))
 
@@ -304,16 +359,21 @@ class FaceDialogueServicer(Node):
 
         final_response = self.final_text(current_selection)
         self.say(final_response)
-        res.task = current_selection["task"]
-        res.cell = current_selection["cell"]
-        res.success = True
-        return res
+        return self.finish_dialogue(res, name, current_selection)
 
 
 def main(args=None):
     rclpy.init(args=args)
     node = FaceDialogueServicer()
-    rclpy.spin(node)
+
+    executor = MultiThreadedExecutor()
+    executor.add_node(node)
+
+    try:
+        executor.spin()
+    finally:
+        executor.remove_node(node)
+        executor.shutdown()
     node.destroy_node()
     rclpy.shutdown()
 
