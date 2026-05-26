@@ -1,0 +1,5 @@
+string gender
+---
+string task
+string cell
+bool success

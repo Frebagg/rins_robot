@@ -1,0 +1,6 @@
+string robot_name
+string output_path
+---
+bool success
+string pdf_path
+string message

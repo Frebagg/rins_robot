@@ -1,0 +1,6 @@
+int32 tile_id
+bool anomaly_detected
+sensor_msgs/Image tile_image
+sensor_msgs/Image mask_image
+---
+bool success

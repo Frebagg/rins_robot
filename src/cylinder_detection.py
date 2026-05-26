@@ -37,6 +37,7 @@ except Exception:  # pragma: no cover - only for non-ROS static checks
     get_package_share_directory = None
 
 from rins_robot.msg import CylinderCoords
+from rins_robot.srv import ReportBarrelImage
 
 
 @dataclass
@@ -157,6 +158,9 @@ class YoloCylinderDetector(Node):
         self.next_id = 1
         self.last_process_time = 0.0
         self.last_status = 'waiting'
+
+        self._leaking_reported: set = set()
+        self._report_barrel_client = self.create_client(ReportBarrelImage, '/report_barrel_image')
 
         self.get_logger().info('YOLO cylinder detector initialized')
         self.get_logger().info(f'image={self.image_topic}')
@@ -303,8 +307,12 @@ class YoloCylinderDetector(Node):
                 continue
 
             valid_3d += 1
-            self._update_tracks(map_point.point, cyl.color, cyl.orientation, leaking, now_wall)
+            track_id = self._update_tracks(map_point.point, cyl.color, cyl.orientation, leaking, now_wall)
             self._draw_detection(debug, cyl, leaking, accepted=True)
+
+            if leaking and track_id > 0 and track_id not in self._leaking_reported:
+                self._leaking_reported.add(track_id)
+                self._report_barrel_image(track_id, bgr, cyl.bbox)
 
         for pud in puddles:
             self._draw_puddle(debug, pud)
@@ -628,11 +636,13 @@ class YoloCylinderDetector(Node):
                 self.get_logger().debug(f'TF failed for cylinder point: {exc}')
                 return None
 
-    def _update_tracks(self, point: Point, color: str, orientation: str, leaking: bool, now_sec: float) -> None:
+    def _update_tracks(self, point: Point, color: str, orientation: str, leaking: bool, now_sec: float) -> int:
+        """Update tracks and return the confirmed track_id, or -1 if not yet confirmed."""
         point = self._track_point(point)
-        if self._hit_confirmed(point, color, orientation, leaking, now_sec):
-            return
-        self._hit_pending(point, color, orientation, leaking, now_sec)
+        track_id = self._hit_confirmed(point, color, orientation, leaking, now_sec)
+        if track_id >= 0:
+            return track_id
+        return self._hit_pending(point, color, orientation, leaking, now_sec)
 
     def _track_point(self, point: Point) -> Point:
         tracked = Point()
@@ -641,7 +651,8 @@ class YoloCylinderDetector(Node):
         tracked.z = self.ground_z_m
         return tracked
 
-    def _hit_confirmed(self, point: Point, color: str, orientation: str, leaking: bool, now_sec: float) -> bool:
+    def _hit_confirmed(self, point: Point, color: str, orientation: str, leaking: bool, now_sec: float) -> int:
+        """Return the matched track_id, or -1 if no confirmed track matched."""
         best_idx = -1
         best_dist = 999.0
         for i, tr in enumerate(self.tracks):
@@ -653,13 +664,15 @@ class YoloCylinderDetector(Node):
                 best_idx = i
 
         if best_idx < 0:
-            return False
+            return -1
 
+        matched_id = self.tracks[best_idx].track_id
         self._update_track(self.tracks[best_idx], point, color, orientation, leaking, now_sec)
         self._merge_duplicate_tracks()
-        return True
+        return matched_id
 
-    def _hit_pending(self, point: Point, color: str, orientation: str, leaking: bool, now_sec: float) -> None:
+    def _hit_pending(self, point: Point, color: str, orientation: str, leaking: bool, now_sec: float) -> int:
+        """Return the newly-confirmed track_id, or -1 if still pending / new."""
         best_idx = -1
         best_dist = 999.0
         for i, tr in enumerate(self.pending_tracks):
@@ -684,9 +697,11 @@ class YoloCylinderDetector(Node):
                     f'hits={tr.count}'
                 )
                 self._merge_duplicate_tracks()
-            return
+                return tr.track_id
+            return -1
 
         self.pending_tracks.append(self._new_track(0, point, color, orientation, leaking, now_sec))
+        return -1
 
     def _new_track(
         self,
@@ -817,6 +832,19 @@ class YoloCylinderDetector(Node):
             msg.orientations.append(str(tr.orientation))
             msg.leaking.append(bool(tr.leaking))
         self.coord_pub.publish(msg)
+
+    def _report_barrel_image(self, track_id: int, bgr: np.ndarray, bbox: Tuple[int, int, int, int]) -> None:
+        """Asynchronously send a cropped barrel image to the report generator."""
+        if not self._report_barrel_client.service_is_ready():
+            return
+        x1, y1, x2, y2 = bbox
+        pad = 20
+        h, w = bgr.shape[:2]
+        crop = bgr[max(0, y1 - pad):min(h, y2 + pad), max(0, x1 - pad):min(w, x2 + pad)]
+        req = ReportBarrelImage.Request()
+        req.barrel_id = track_id
+        req.image = self.bridge.cv2_to_imgmsg(crop, encoding='bgr8')
+        self._report_barrel_client.call_async(req)
 
     def _draw_detection(self, img: np.ndarray, det: Detection2D, leaking: bool, accepted: bool) -> None:
         x1, y1, x2, y2 = det.bbox
