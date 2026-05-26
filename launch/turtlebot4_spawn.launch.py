@@ -34,7 +34,7 @@ ARGUMENTS = [
     DeclareLaunchArgument('use_sim_time', default_value='true',choices=['true', 'false'],description='use_sim_time'),
     DeclareLaunchArgument('model', default_value='standard',choices=['standard', 'lite'],description='Turtlebot4 Model'),
     DeclareLaunchArgument('namespace', default_value='', description='Robot namespace'),
-    DeclareLaunchArgument('world', default_value='task2_blue_demo', description='World name')
+    DeclareLaunchArgument('world', default_value='task2', description='World name')
 ]
 
 for pose_element in ['x', 'y', 'z', 'yaw']:
