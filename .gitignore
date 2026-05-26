@@ -228,4 +228,5 @@ __marimo__/
 !/models/
 !/models/*.pt
 
-
+models/anomaly_model.pt
+RINS_AD_dataset/
