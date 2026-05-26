@@ -14,6 +14,7 @@ rosidl_generate_interfaces(${PROJECT_NAME}
   "msg/RingCoords.msg"
   "msg/CylinderCoords.msg"
   "srv/Speech.srv"
+  "srv/FaceDialogue.srv"
   DEPENDENCIES geometry_msgs
 )
 
@@ -28,6 +29,7 @@ install(DIRECTORY
 
 install(PROGRAMS
   src/face_detection.py
+  src/face_dialogue_servicer.py
   src/ring_detector.py
   src/cylinder_detection.py
   src/visualiser.py
