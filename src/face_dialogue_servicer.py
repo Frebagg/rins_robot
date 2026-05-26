@@ -77,7 +77,7 @@ class FaceDialogueServicer(Node):
         model_name = os.environ.get("RINS_WHISPER_MODEL", "base.en")
         preferred_device = os.environ.get(
             "RINS_WHISPER_DEVICE",
-            "cuda" if self._cuda_available() else "cpu"
+            "cpu"
         ).strip().lower()
         requested_compute_type = os.environ.get("RINS_WHISPER_COMPUTE_TYPE")
 
@@ -142,8 +142,10 @@ class FaceDialogueServicer(Node):
 
         frames = int(self.sample_rate * self.utterance_seconds)
         try:
+            self.get_logger().info("Recording audio for face dialogue...")
             audio = sd.rec(frames, samplerate=self.sample_rate, channels=1, dtype="float32")
             sd.wait()
+            self.get_logger().info("Finished recording audio.")
             return np.squeeze(audio)
         except Exception as exc:
             self.get_logger().error(f"Could not record audio: {exc}")
@@ -167,11 +169,12 @@ class FaceDialogueServicer(Node):
         if self.whisper_model is None:
             return ""
 
+        self.get_logger().info(f"Transcribing audio from {audio_path}...")
         segments, _info = self.whisper_model.transcribe(
             audio_path,
             language="en",
-            vad_filter=True,
-            beam_size=3,
+            vad_filter=False,
+            beam_size=1,
             initial_prompt="""
             Possible commands are:
             inspect the barrels, inspect barrels
@@ -272,18 +275,25 @@ class FaceDialogueServicer(Node):
         return res
 
     def listen_once(self):
+        self.get_logger().info("Listening for a face dialogue reply...")
         audio = self.record_audio()
         if audio is None:
+            self.get_logger().warn("No audio captured.")
             return ""
 
         audio_path = self.save_audio(audio)
+        self.get_logger().info(f"Saved dialogue audio to {audio_path}")
+        keep_audio = os.environ.get("RINS_KEEP_DIALOGUE_AUDIO", "1").strip().lower() in {"1", "true", "yes"}
         try:
-            return self.transcribe(audio_path)
+            text = self.transcribe(audio_path)
+            self.get_logger().info(f"Listen result: '{text}'")
+            return text
         finally:
-            try:
-                os.remove(audio_path)
-            except OSError:
-                pass
+            if not keep_audio:
+                try:
+                    os.remove(audio_path)
+                except OSError:
+                    pass
 
     def ask_and_listen(self, phrase):
         self.speak(phrase)
@@ -298,8 +308,21 @@ class FaceDialogueServicer(Node):
         self.say(self.prompt_text(gender))
 
         if gender == "M":
-            first_reply = self.listen_once()
-            selection = self.parse_task(first_reply) or {"task": "nothing", "cell": "none"}
+            turns = 0
+            while turns < self.max_turns:
+                first_reply = self.listen_once()
+                turns += 1
+
+                selection = self.parse_task(first_reply)
+                if selection is None:
+                    self.say(self.prompt_text(gender))
+                    continue
+
+                response_text = self.final_text(selection)
+                self.say(response_text)
+                return self.finish_dialogue(res, name, selection)
+
+            selection = {"task": "nothing", "cell": "none"}
             response_text = self.final_text(selection)
             self.say(response_text)
             return self.finish_dialogue(res, name, selection)

@@ -86,7 +86,7 @@ class detect_faces(Node):
 		self.pendingCoords = [] # kandidati pred potrditvijo: (Point(), stevilo_detekcij, cas_zadnje_detekcije)
 		self.nextFaceId = 1
 		self.COUNTTHRESHOLD = 10
-		self.CONFIDENCETHRESHOLD = 0.7
+		self.CONFIDENCETHRESHOLD = 0.5
 		self.MATCH_XY_THRESHOLD = 1.2
 		self.MATCH_Z_THRESHOLD = 1.2
 		self.PENDING_XY_THRESHOLD = 0.9

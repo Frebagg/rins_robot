@@ -52,8 +52,8 @@ class RingDetector(Node):
 
         # Parametri za stanje
         self.latest_depth = None  # zadnja depth slika (float32, metri)
-        self.rings_2d     = []    # zaznave iz trenutnega frame-a: [(ellipse, color), ...]
-        self.coords       = []    # tabela unikatnih obročev: [(id, Point, color), ...]
+        self.rings_2d     = []    # zaznave iz trenutnega frame-a: [(ellipse, color, confidence), ...]
+        self.coords       = []    # tabela unikatnih obročev: [(id, Point, color_scores, count), ...]
         self.next_ring_id = 1     # naraščajoči ID za nove obroče
 
         # ROS infrastruktura
@@ -156,15 +156,15 @@ class RingDetector(Node):
             cv2.ellipse(vis, ellipse,       (0, 255, 0), 2)  # zunanja elipsa
             cv2.ellipse(vis, inner_ellipse, (0, 255, 0), 1)  # notranja (luknja)
 
-            color_name = self.classify_ring_color(cv_image, ellipse)
+            color_name, color_confidence = self.classify_ring_color(cv_image, ellipse)
 
             cx, cy = int(ellipse[0][0]), int(ellipse[0][1])
             cv2.circle(vis, (cx, cy), 3, (0, 0, 255), -1)
-            cv2.putText(vis, color_name, (cx + 10, cy),
+            cv2.putText(vis, f"{color_name} {color_confidence:.2f}", (cx + 10, cy),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
 
             # Shranimo 2D zaznavo za pointcloud_callback, ki bo izračunal 3D pozicijo
-            self.rings_2d.append((ellipse, color_name))
+            self.rings_2d.append((ellipse, color_name, color_confidence))
 
         cv2.imshow("Detected rings", vis)
         cv2.waitKey(1)
@@ -195,7 +195,7 @@ class RingDetector(Node):
         pts = pc2.read_points_numpy(data, field_names=("x", "y", "z"))
         pts = pts.reshape((data.height, data.width, 3))
 
-        for ellipse, color in self.rings_2d:
+        for ellipse, color, color_confidence in self.rings_2d:
             if color == "unknown":
                 continue
 
@@ -214,20 +214,22 @@ class RingDetector(Node):
             if not np.isfinite([x, y, z]).all():
                 continue
 
-            self.get_logger().info(f"Nova zaznava: {color}  x={x:.2f} y={y:.2f} z={z:.2f}")
+            self.get_logger().info(f"Nova zaznava: {color} ({color_confidence:.2f})  x={x:.2f} y={y:.2f} z={z:.2f}")
 
-            # Preverimo ali se zaznava ujema z že obstoječim obroč (merge)
+            # Preverimo ali je v blizini ze obstojec obroc. Barva ne vpliva na merge.
             merged = False
-            for i, (ring_id, ring_pt, ring_color) in enumerate(self.coords):
-                if ring_color != color:
-                    continue
-                if (abs(ring_pt.x - x) < self.merge_distance_xy and abs(ring_pt.y - y) < self.merge_distance_xy and abs(ring_pt.z - z) < self.merge_distance_z):
-                    # Povprečimo pozicijo z novo zaznavo (running average)
-                    ring_pt.x = (ring_pt.x + x) / 2.0
-                    ring_pt.y = (ring_pt.y + y) / 2.0
-                    ring_pt.z = (ring_pt.z + z) / 2.0
-                    self.coords[i] = (ring_id, ring_pt, ring_color)
-                    self.get_logger().info(f"  → združeno z obročem #{ring_id}")
+            for i, (ring_id, ring_pt, color_scores, count) in enumerate(self.coords):
+                xy_dist = float(np.hypot(ring_pt.x - x, ring_pt.y - y))
+                z_dist = abs(ring_pt.z - z)
+                if xy_dist <= self.merge_distance_xy and z_dist <= self.merge_distance_z:
+                    new_count = count + 1
+                    ring_pt.x = (ring_pt.x * count + x) / new_count
+                    ring_pt.y = (ring_pt.y * count + y) / new_count
+                    ring_pt.z = (ring_pt.z * count + z) / new_count
+                    color_scores[color] = color_scores.get(color, 0.0) + max(float(color_confidence), 1e-3)
+                    best_color = self.best_color(color_scores)
+                    self.coords[i] = (ring_id, ring_pt, color_scores, new_count)
+                    self.get_logger().info(f"  → združeno z obročem #{ring_id}, barva={best_color}")
                     merged = True
                     break
 
@@ -235,7 +237,8 @@ class RingDetector(Node):
                 # Dodamo nov obroč v tabelo
                 p = Point()
                 p.x, p.y, p.z = x, y, z
-                self.coords.append((self.next_ring_id, p, color))
+                color_scores = {color: max(float(color_confidence), 1e-3)}
+                self.coords.append((self.next_ring_id, p, color_scores, 1))
                 self.get_logger().info(f"  → nov obroč #{self.next_ring_id}: {color}")
                 self.next_ring_id += 1
 
@@ -245,12 +248,12 @@ class RingDetector(Node):
     def publish_rings_callback(self):
         """Periodično objavlja tabelo vseh znanih obročev na /ring_coords."""
         msg = RingCoords()
-        for ring_id, ring_pt, color in self.coords:
+        for ring_id, ring_pt, color_scores, _ in self.coords:
             if not np.isfinite([ring_pt.x, ring_pt.y, ring_pt.z]).all():
                 continue
             msg.ids.append(ring_id)
             msg.points.append(ring_pt)
-            msg.colors.append(color)
+            msg.colors.append(self.best_color(color_scores))
         self.coord_publisher.publish(msg)
 
     def ellipse_is_ring(self, depth, ellipse):
@@ -409,6 +412,50 @@ class RingDetector(Node):
         norm[d == 0] = 1.0  # neveljavne točke → bele (daleč)
         return (norm * 255).astype(np.uint8)
 
+    def best_color(self, color_scores):
+        if not color_scores:
+            return "unknown"
+        return max(color_scores.items(), key=lambda item: item[1])[0]
+
+    def color_confidence(self, hsv_pixels, color_name):
+        if color_name == "unknown" or len(hsv_pixels) == 0:
+            return 0.0
+
+        h = hsv_pixels[:, 0]
+        s = hsv_pixels[:, 1]
+        v = hsv_pixels[:, 2]
+
+        if color_name == "red":
+            match = ((h < 10) | (h >= 170)) & (s > 60)
+        elif color_name == "orange":
+            match = (h >= 10) & (h < 25) & (s > 60)
+        elif color_name == "yellow":
+            match = (h >= 25) & (h < 35) & (s > 60)
+        elif color_name == "green":
+            match = (h >= 35) & (h < 85) & (s > 60)
+        elif color_name == "blue":
+            match = (h >= 85) & (h < 130) & (s > 60)
+        elif color_name == "purple":
+            match = (h >= 130) & (h < 170) & (s > 60)
+        elif color_name == "white":
+            match = (s <= 60) & (v > 180)
+        elif color_name == "black":
+            match = (s <= 60) & (v < 60)
+        elif color_name == "gray":
+            match = (s <= 60) & (v >= 60) & (v <= 180)
+        else:
+            return 0.0
+
+        if not np.any(match):
+            return 0.05
+
+        pixel_ratio = float(np.count_nonzero(match)) / float(len(hsv_pixels))
+        if color_name in ("white", "black", "gray"):
+            strength = 1.0 - min(float(np.mean(s[match])) / 255.0, 1.0)
+        else:
+            strength = min(float(np.mean(s[match])) / 255.0, 1.0)
+        return max(0.05, pixel_ratio * strength)
+
     def classify_ring_color(self, bgr_image, ellipse):
         """
         Klasificira barvo obroča iz RGB slike z analizo HSV vrednosti.
@@ -425,7 +472,7 @@ class RingDetector(Node):
         ring_pixels = hsv[ring_mask > 0]
 
         if len(ring_pixels) < 20:
-            return "unknown"
+            return "unknown", 0.0
 
         s = ring_pixels[:, 1]
         v = ring_pixels[:, 2]
@@ -437,29 +484,32 @@ class RingDetector(Node):
             # Pretežno akromatska barva → določimo po svetlosti
             median_v = float(np.median(v))
             if   median_v > 180: 
-                return "white"
+                color_name = "white"
             elif median_v < 60:  
-                return "black"
+                color_name = "black"
             else:                
-                return "gray"
+                color_name = "gray"
+            return color_name, self.color_confidence(ring_pixels, color_name)
 
         # H je v razponu 0–179 (OpenCV konvencija)
         median_h = float(np.median(colored[:, 0]))
 
         if   median_h < 10 or median_h >= 170: 
-            return "red"
+            color_name = "red"
         elif median_h < 25:                    
-            return "orange"
+            color_name = "orange"
         elif median_h < 35:                    
-            return "yellow"
+            color_name = "yellow"
         elif median_h < 85:                    
-            return "green"
+            color_name = "green"
         elif median_h < 130:                   
-            return "blue"
+            color_name = "blue"
         elif median_h < 170:                   
-            return "purple"
+            color_name = "purple"
+        else:
+            color_name = "unknown"
 
-        return "unknown"
+        return color_name, self.color_confidence(ring_pixels, color_name)
 
 
 def main():

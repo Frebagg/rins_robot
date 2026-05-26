@@ -40,6 +40,10 @@ from std_msgs.msg import String
 #ZA DRUGI KROG
 from rins_robot.msg import CylinderCoords
 from rins_robot.msg import FaceCoords
+from rins_robot.msg import RingCoords
+from rins_robot.srv import BoundingBox
+from rins_robot.srv import FaceDialogue
+from rins_robot.srv import ReportTaskAssignment
 from rins_robot.srv import Speech
 import numpy as np
 
@@ -94,11 +98,16 @@ class RobotCommander(Node):
         #-----------------------------------------------------------------------------------------
         self.create_subscription(FaceCoords,"/face_coords",self.updateFaceCoords,10)
         self.create_subscription(CylinderCoords,"/cylinder_coords",self.updateCylinderCoords,10)
+        self.create_subscription(RingCoords,"/ring_coords",self.updateRingCoords,10)
 
         self.greetClient = self.create_client(Speech,"/greet_service")
+        self.boundingBoxClient = self.create_client(BoundingBox,"/bounding_box_service")
+        self.faceDialogueClient = self.create_client(FaceDialogue,"/face_dialogue_service")
+        self.reportTaskClient = self.create_client(ReportTaskAssignment,"/report_task_assignment")
 
         self.faces = []
         self.cylinders = []
+        self.rings = []
         #-----------------------------------------------------------------------------------------
         
         # ROS2 publishers
@@ -490,6 +499,9 @@ class RobotCommander(Node):
             data.leaking
         ))
 
+    def updateRingCoords(self,data):
+        self.rings = list(zip(data.points, data.ids,data.colors))
+
     def get_robot_position(self):
         return np.array([
             self.current_pose.pose.position.x,
@@ -497,7 +509,7 @@ class RobotCommander(Node):
             self.current_pose.pose.position.z
         ])
 
-    def _build_standoff_goal(self, target_x, target_y, standoff_distance=0.30):
+    def _build_standoff_goal(self, target_x, target_y, standoff_distance=0.25):
         robotPos = self.get_robot_position()
         dx = target_x - robotPos[0]
         dy = target_y - robotPos[1]
@@ -524,7 +536,7 @@ class RobotCommander(Node):
 
         return goal_pose
 
-    def _go_close_enough(self, target_x, target_y, standoff_distance=0.30, close_enough_distance=0.60):
+    def _go_close_enough(self, target_x, target_y, standoff_distance=0.25, close_enough_distance=0.45):
         """Navigate to a standoff point and accept failures if we are still close enough."""
         goal_pose = self._build_standoff_goal(target_x, target_y, standoff_distance)
         if not self.goToPose(goal_pose):
@@ -553,59 +565,188 @@ class RobotCommander(Node):
         )
         return False
 
-    def visitDetections(self):
-        #najprej obrazi
-        request = Speech.Request()
-        request.data = "Hello, human"
-
-        end_time = time.monotonic() + 1.0
+    def spinSome(self, seconds=1.0):
+        end_time = time.monotonic() + seconds
         while time.monotonic() < end_time:
             rclpy.spin_once(self, timeout_sec=0.1)
 
+    def say(self, text):
+        if not self.greetClient.wait_for_service(timeout_sec=2.0):
+            self.warn("/greet_service is not available.")
+            return False
+
+        request = Speech.Request()
+        request.data = text
+        future = self.greetClient.call_async(request)
+        rclpy.spin_until_future_complete(self, future)
+        response = future.result()
+        return response is not None and response.success
+
+    def recognizeFaceTwice(self):
+        if not self.boundingBoxClient.wait_for_service(timeout_sec=2.0):
+            self.warn("/bounding_box_service is not available.")
+            return "UNKNOWN", "M"
+
+        request = BoundingBox.Request()
+        request.data = True
+
+        best_response = None
+        for attempt in range(5):
+            future = self.boundingBoxClient.call_async(request)
+            rclpy.spin_until_future_complete(self, future)
+            response = future.result()
+
+            if response is None:
+                self.warn(f"Face recognition call failed on attempt {attempt + 1}.")
+                time.sleep(0.4)
+                continue
+
+            person = (response.person or "UNKNOWN").strip()
+            gender = (response.gender or "M").strip().upper()
+            if person not in {"", "NONE", "UNKNOWN"}:
+                best_response = (person, gender if gender in {"M", "F"} else "M")
+                break
+
+            self.info(
+                f"Face recognition attempt {attempt + 1} returned "
+                f"{response.person} ({response.gender}); retrying..."
+            )
+            time.sleep(0.4)
+
+        if best_response is None:
+            self.warn("Could not get a stable face recognition result.")
+            return "UNKNOWN", "M"
+
+        person, gender = best_response
+
+        self.info(f"Recognized face as {person} ({gender}).")
+        return person, gender
+
+    def requestTaskFromPerson(self, person, gender):
+        if not self.faceDialogueClient.wait_for_service(timeout_sec=2.0):
+            self.warn("/face_dialogue_service is not available.")
+            return None
+
+        request = FaceDialogue.Request()
+        request.name = person
+        request.gender = gender
+
+        future = self.faceDialogueClient.call_async(request)
+        rclpy.spin_until_future_complete(self, future)
+        response = future.result()
+
+        if response is None or not response.success:
+            self.warn(f"Dialogue failed for {person}.")
+            return None
+
+        assignment = {
+            "person": person,
+            "gender": gender,
+            "task": response.task,
+            "cell": response.cell,
+        }
+        self.info(f"Task from {person}: {response.task} ({response.cell})")
+        self.reportTaskAssignment(assignment)
+        return assignment
+
+    def reportTaskAssignment(self, assignment):
+        if not self.reportTaskClient.wait_for_service(timeout_sec=0.5):
+            self.warn("/report_task_assignment is not available.")
+            return False
+
+        request = ReportTaskAssignment.Request()
+        request.person_name = assignment["person"]
+        request.task = assignment["task"]
+        request.cell = assignment["cell"]
+
+        future = self.reportTaskClient.call_async(request)
+        rclpy.spin_until_future_complete(self, future)
+        response = future.result()
+        return response is not None and response.success
+
+    def collectTasksFromFaces(self):
+        self.spinSome(1.0)
         facesCopy = self.faces.copy()
+        assignments = []
+
+        self.info(f"Going to collect tasks from {len(facesCopy)} faces.")
+        for point,id in facesCopy:
+            self.info(f"Going towards face {id}.")
+            if not self._go_close_enough(point.x, point.y, standoff_distance=0.1, close_enough_distance=0.25):
+                continue
+
+            person, gender = self.recognizeFaceTwice()
+            assignment = self.requestTaskFromPerson(person, gender)
+            if assignment is not None:
+                assignments.append(assignment)
+
+        self.info(f"Collected {len(assignments)} task assignments.")
+        return assignments
+
+    def executeRingTask(self):
+        self.spinSome(1.0)
+        count = len(self.rings)
+        self.info(f"Ring task: counted {count} rings.")
+        self.say(f"I detected {count} rings.")
+        return True
+
+    def executeBarrelTask(self):
+        self.spinSome(1.0)
         lyingCylindersCopy = [
             cylinder for cylinder in self.cylinders.copy()
             if str(cylinder[3]).lower() == "lying"
         ]
-        self.info(f"Going to visit {len(facesCopy)} faces and {len(lyingCylindersCopy)} lying cylinders.")
+        self.info(f"Barrel task: visiting {len(lyingCylindersCopy)} lying cylinders.")
 
-        for point,id in facesCopy:
-            self.info(f"Going towards face {id}.")
-            x = point.x
-            y = point.y
-
-            if not self._go_close_enough(x, y, standoff_distance=0.30, close_enough_distance=0.60):
-                continue
-            
-            future = self.greetClient.call_async(request)
-            rclpy.spin_until_future_complete(self,future)
-            time.sleep(1)
-            #time.sleep(2.0)
-            response = future.result()
-            if response is not None and response.success == True:
-                self.info("Sucessfuly talked to a human!")
-            else:
-                self.info("Failed to talk to a human!")
-
-        #obisci lezece cilindre
         for point,id,color,orientation,leaking in lyingCylindersCopy:
             self.info(f"Going towards lying cylinder {id}.")
-            x = point.x
-            y = point.y
-
-            if not self._go_close_enough(x, y, standoff_distance=0.45, close_enough_distance=0.80):
+            if not self._go_close_enough(point.x, point.y, standoff_distance=0.25, close_enough_distance=0.5):
                 continue
 
             if leaking:
-                request.data = "Warning, spill detected"
-                future = self.greetClient.call_async(request)
-                rclpy.spin_until_future_complete(self,future)
-                time.sleep(1)
-                response = future.result()
-                if response is not None and response.success == True:
+                if self.say("Alert! Alert! This barrel is leaking!"):
                     self.info("Successfully warned about a spill!")
                 else:
                     self.info("Failed to warn about a spill!")
+
+        return True
+
+    def executeAnomalyTask(self, cell):
+        cell = (cell or "").lower()
+        if cell == "red":
+            return self.runRedAnomalyMovement()
+        if cell == "green":
+            return self.runGreenAnomalyMovement()
+
+        self.warn(f"Unknown anomaly cell: {cell}")
+        return False
+
+    def executeTaskAssignment(self, assignment):
+        task = (assignment["task"] or "").lower()
+        cell = (assignment["cell"] or "none").lower()
+        person = assignment["person"]
+
+        self.info(f"Executing task from {person}: {task} ({cell})")
+        if task == "rings":
+            return self.executeRingTask()
+        if task == "barrels":
+            return self.executeBarrelTask()
+        if task == "anomaly":
+            return self.executeAnomalyTask(cell)
+        if task == "nothing":
+            self.info(f"{person} requested no task.")
+            return True
+
+        self.warn(f"Unknown task from {person}: {task}")
+        return False
+
+    def executeTaskAssignments(self, assignments):
+        for assignment in assignments:
+            self.executeTaskAssignment(assignment)
+
+    def visitDetections(self):
+        assignments = self.collectTasksFromFaces()
+        self.executeTaskAssignments(assignments)
     #--------------------------------------------------------------------------
 
 def main(args=None):
@@ -641,14 +782,14 @@ def main(args=None):
         (3, 0.0, -3.7, 3),
         (3, 0.0, -3.7, 0),
         (4, 0.9, -4.48, 3),
-        (5, -2.5, -4.6, 8),
+        (5, -2.4, -4.6, 8),
         (6, -1.18, -1.8, 8),
         (7, -1.5, -0.93, 3),
         (8, -2.9, -2.85, 8),
         (9, -4.2, -1.8, 8),
         (10, -4.3, 0.425, 8),
         (11, -3.3, -0.5, 1),
-        (12, -1.15, 0.35, 8),
+        (12, -1.35, 0.35, 8),
         (13, 1.5, 0.25, 8),
         (14, 3.05, -0.45, 8)
     ]
@@ -705,8 +846,8 @@ def main(args=None):
     
     time.sleep(2)
     #-----------------------------------------------------------------
-    #DRUGI KROG - OBISKI DETECTIONOV
-    rc.info("Going to visit detections now")
+    #DRUGI KROG - POGOVORI IN IZVAJANJE TASKOV
+    rc.info("Going to collect face tasks and execute them")
     rc.visitDetections()
 
     # Za rocni test anomaly premika odkomentiraj eno vrstico:
