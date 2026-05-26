@@ -1,0 +1,5 @@
+int32 tile_id
+---
+bool anomaly_detected
+float32 defect_score
+bool success

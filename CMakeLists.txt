@@ -8,6 +8,7 @@ endif()
 find_package(ament_cmake REQUIRED)
 find_package(rosidl_default_generators REQUIRED)
 find_package(geometry_msgs REQUIRED)
+find_package(sensor_msgs REQUIRED)
 
 rosidl_generate_interfaces(${PROJECT_NAME}
   "msg/FaceCoords.msg"
@@ -15,7 +16,12 @@ rosidl_generate_interfaces(${PROJECT_NAME}
   "msg/CylinderCoords.msg"
   "srv/Speech.srv"
   "srv/FaceDialogue.srv"
-  DEPENDENCIES geometry_msgs
+  "srv/GenerateReport.srv"
+  "srv/ReportTaskAssignment.srv"
+  "srv/ReportAnomalyTile.srv"
+  "srv/ReportBarrelImage.srv"
+  "srv/InspectTile.srv"
+  DEPENDENCIES geometry_msgs sensor_msgs
 )
 
 install(DIRECTORY
@@ -39,7 +45,10 @@ install(PROGRAMS
   src/speech_servicer.py
   src/robot_commander.py
   src/line_follower.py
+  src/report_generator.py
+  src/anomaly_detector.py
   tools/train_cylinder_yolo.py
+  tools/train_anomaly_detector.py
   DESTINATION lib/${PROJECT_NAME}
 )
 
