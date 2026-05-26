@@ -27,6 +27,7 @@ Parameters (ROS2):
 from __future__ import annotations
 
 import os
+from datetime import datetime
 from typing import Optional
 
 import cv2
@@ -52,15 +53,42 @@ class AnomalyDetectorNode(Node):
             ('stable_frames', 8),
             ('stable_iou', 0.85),
             ('reacquire_misses', 6),
+            # ── tile-must-overlap-center gate ────────────────────────────────
+            # Inspect when any part of the tile's rotated rect overlaps a
+            # thin vertical band at image center. Width of the band is
+            # `center_band_ratio` * frame_width (default: very thin, so it
+            # behaves like "any part of the rect crosses the center line").
+            ('center_band_ratio',  0.02),
+            # ── crop expansion (optional safety margins; default off) ────────
+            # The warp now fits the tile's true 4-corner polygon directly,
+            # so by default we want a pure tight hug. These knobs exist
+            # only if you want to dial in a small safety margin later.
+            ('edge_dilate_px',   0),
+            ('crop_pad_ratio',   0.0),
+            # ── model input geometry (must match training) ───────────────────
+            ('target_size', 512),
+            # ── output ───────────────────────────────────────────────────────
+            ('save_dir', '/images'),
         ])
 
-        self.camera_topic     = self.get_parameter('camera_topic').value
-        self.model_path       = str(self.get_parameter('model_path').value)
-        self.show_debug       = bool(self.get_parameter('show_debug').value)
-        self.auto_scan        = bool(self.get_parameter('auto_scan').value)
-        self.stable_frames    = int(self.get_parameter('stable_frames').value)
-        self.stable_iou       = float(self.get_parameter('stable_iou').value)
-        self.reacquire_misses = int(self.get_parameter('reacquire_misses').value)
+        self.camera_topic      = self.get_parameter('camera_topic').value
+        self.model_path        = str(self.get_parameter('model_path').value)
+        self.show_debug        = bool(self.get_parameter('show_debug').value)
+        self.auto_scan         = bool(self.get_parameter('auto_scan').value)
+        self.stable_frames     = int(self.get_parameter('stable_frames').value)
+        self.stable_iou        = float(self.get_parameter('stable_iou').value)
+        self.reacquire_misses  = int(self.get_parameter('reacquire_misses').value)
+        self.center_band_ratio = float(self.get_parameter('center_band_ratio').value)
+        self.edge_dilate_px    = int(self.get_parameter('edge_dilate_px').value)
+        self.crop_pad_ratio    = float(self.get_parameter('crop_pad_ratio').value)
+        self.target_size       = int(self.get_parameter('target_size').value)
+        self.save_dir          = str(self.get_parameter('save_dir').value)
+
+        try:
+            os.makedirs(self.save_dir, exist_ok=True)
+        except Exception as e:
+            self.get_logger().warn(
+                f'Could not create save_dir {self.save_dir}: {e}')
 
         if not self.model_path:
             self.model_path = self._default_model_path()
@@ -133,29 +161,63 @@ class AnomalyDetectorNode(Node):
 
     def _detect_tile(self, frame: np.ndarray):
         """
-        Find the most prominent tile-shaped region anywhere in the frame.
-        Tile may be tilted.
+        Find the tile on a near-black conveyor.
+
+        Tiles are grayish-brown, background is black — so a simple brightness
+        threshold cleanly separates them. We use Otsu (which auto-picks the
+        split between the two modes), then take the largest sufficiently-
+        rectangular blob as the tile.
 
         Returns:
-            (rot_rect, aabb)  on success
-                rot_rect : ((cx, cy), (w, h), angle)  in frame coords
-                aabb     : (x, y, w, h)               in frame coords
-            (None, None)      if no tile candidate found
+            (rot_rect, aabb, contour)  on success
+                rot_rect : ((cx, cy), (w, h), angle)
+                aabb     : (x, y, w, h)
+                contour  : Nx1x2 int32 array of the tile's outline
+            (None, None, None)         if no tile candidate found
         """
         H, W = frame.shape[:2]
 
-        gray    = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-        blurred = cv2.GaussianBlur(gray, (7, 7), 0)
-        edges   = cv2.Canny(blurred, 30, 100)
-        kernel  = cv2.getStructuringElement(cv2.MORPH_RECT, (5, 5))
-        edges   = cv2.dilate(edges, kernel, iterations=2)
+        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
 
+        # Otsu picks the threshold automatically between the two brightness
+        # modes (black background ≈ 0–20, tile ≈ 80–180). Falls back
+        # gracefully if the frame is all-black or all-tile.
+        _, binary = cv2.threshold(
+            gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+
+        # Safety net: if Otsu landed in a weird place (very dim or very bright
+        # frame), force a low fixed threshold. Background is black, so any
+        # pixel above ~10 is part of a tile (aggressive — catches dim edge
+        # transition pixels too).
+        if cv2.countNonZero(binary) < 0.005 * H * W:
+            _, binary = cv2.threshold(gray, 10, 255, cv2.THRESH_BINARY)
+
+        # Clean up: small holes inside the tile (specular spots / defects),
+        # tiny noise outside it. Open kills speckle, close fills holes.
+        k = cv2.getStructuringElement(cv2.MORPH_RECT, (5, 5))
+        binary = cv2.morphologyEx(binary, cv2.MORPH_OPEN,  k, iterations=1)
+        binary = cv2.morphologyEx(binary, cv2.MORPH_CLOSE, k, iterations=2)
+
+        # Grow the mask outward so the contour reaches the true tile edge.
+        # Otsu drops the dim transition pixels at the tile boundary, leaving
+        # the contour ~1-3 px inside the actual edge; dilation reclaims that.
+        if self.edge_dilate_px > 0:
+            d = 2 * self.edge_dilate_px + 1
+            dilate_k = cv2.getStructuringElement(cv2.MORPH_RECT, (d, d))
+            binary = cv2.dilate(binary, dilate_k, iterations=1)
+
+        # Pad by 1px so tiles touching the frame border still close into
+        # contours.
+        padded = cv2.copyMakeBorder(binary, 1, 1, 1, 1,
+                                    cv2.BORDER_CONSTANT, value=0)
         contours, _ = cv2.findContours(
-            edges, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+            padded, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        contours = [c - 1 for c in contours]
 
-        min_area = W * H * 0.03            # tile ≥3% of frame
-        max_area = W * H * 0.95            # not the whole frame
-        best = None
+        min_area = W * H * 0.01            # tile ≥1% of frame
+        max_area = W * H * 0.95
+        best_rect = None
+        best_cnt  = None
         best_area = 0.0
 
         for cnt in contours:
@@ -172,22 +234,23 @@ class AnomalyDetectorNode(Node):
             if aspect > 3.0:               # tiles aren't ribbon-shaped
                 continue
 
-            # rectangularity: area / (w*h of minAreaRect)
             rect_area = rw_ * rh_
             if rect_area <= 0:
                 continue
             rectangularity = area / rect_area
-            if rectangularity < 0.65:      # too irregular
+            if rectangularity < 0.75:      # solid tile vs irregular blob
                 continue
 
+            # Pick the largest valid tile.
             if area > best_area:
                 best_area = area
-                best = rect
+                best_rect = rect
+                best_cnt  = cnt
 
-        if best is None:
-            return None, None
+        if best_rect is None:
+            return None, None, None
 
-        rot_rect = best
+        rot_rect = best_rect
 
         # axis-aligned bbox (for tracking IoU & quick viz)
         box_pts = cv2.boxPoints(rot_rect).astype(np.int32)
@@ -196,33 +259,122 @@ class AnomalyDetectorNode(Node):
         w = min(W - x, w);  h = min(H - y, h)
         aabb = (x, y, w, h)
 
-        return rot_rect, aabb
+        return rot_rect, aabb, best_cnt
 
-    def _warp_tile_upright(self, frame: np.ndarray,
-                           rot_rect: tuple) -> np.ndarray:
-        """De-rotate the tile to an upright rectangle via perspective warp."""
-        box = cv2.boxPoints(rot_rect)              # 4 corners, float32
-        (_, _), (rw_, rh_), _ = rot_rect
-        # ensure portrait/landscape consistent: longer side = width
-        tw = int(round(max(rw_, rh_)))
-        th = int(round(min(rw_, rh_)))
-        tw = max(tw, 16);  th = max(th, 16)
+    def _find_tile_quad(self, contour: np.ndarray,
+                        rot_rect: tuple) -> np.ndarray:
+        """
+        Find 4 corner points that hug the tile's actual outline.
 
-        # order box points: tl, tr, br, bl
-        pts = box.astype(np.float32)
+        Strategy:
+          1. Try approxPolyDP with a few epsilon values — if the contour
+             simplifies to exactly 4 points, use those (best fit for tiles
+             that are genuine quadrilaterals, perspective-skewed or not).
+          2. Otherwise, pick 4 extreme corners: from the rotated rect's 4
+             corners, find the contour point closest to each. This gives
+             a tight 4-point hug for tiles with rounded/chamfered corners
+             where approxPolyDP would over-simplify.
+
+        Returns a (4, 2) float32 array of corner points, ordered TL, TR,
+        BR, BL.
+        """
+        # --- attempt 1: approxPolyDP ---
+        # We accept a 4-point approximation only if it doesn't significantly
+        # under-cover the contour. Rounded-corner tiles will simplify to 4
+        # points but with corner area cut off; we want those to fall through
+        # to the extreme-corners method instead.
+        cnt_area = cv2.contourArea(contour)
+        perimeter = cv2.arcLength(contour, closed=True)
+        for eps_frac in (0.01, 0.015, 0.02, 0.03, 0.04, 0.05):
+            approx = cv2.approxPolyDP(contour, eps_frac * perimeter, closed=True)
+            if len(approx) == 4 and cv2.isContourConvex(approx):
+                approx_area = cv2.contourArea(approx)
+                # Quad must cover ≥97% of the contour's area to be considered
+                # a faithful fit. Less means we're cutting corner curvature.
+                if cnt_area > 0 and approx_area / cnt_area >= 0.97:
+                    quad = approx.reshape(4, 2).astype(np.float32)
+                    return self._order_quad(quad)
+
+        # --- fallback: extreme corners along the rect's diagonals ---
+        # We want corners that CONTAIN the contour (so the quad's edges
+        # don't cut through curved/rounded corners). For each direction
+        # corresponding to a rect corner, find the contour point that is
+        # FURTHEST in that direction. This naturally handles rounded
+        # corners — the extreme point along the diagonal is past the
+        # corner's curvature.
+        rect_corners = cv2.boxPoints(rot_rect).astype(np.float32)  # (4, 2)
+        center = rect_corners.mean(axis=0)
+        cnt_pts = contour.reshape(-1, 2).astype(np.float32)         # (N, 2)
+
+        chosen = []
+        for rc in rect_corners:
+            direction = rc - center
+            direction /= (np.linalg.norm(direction) + 1e-9)
+            # Project every contour point onto this direction; take the max.
+            projections = (cnt_pts - center) @ direction
+            chosen.append(cnt_pts[int(np.argmax(projections))])
+        quad = np.array(chosen, dtype=np.float32)
+        return self._order_quad(quad)
+
+    @staticmethod
+    def _order_quad(pts: np.ndarray) -> np.ndarray:
+        """
+        Order 4 points as TL, TR, BR, BL using sum/diff of coordinates.
+        TL has smallest x+y, BR largest x+y; TR has smallest x-y, BL largest.
+        """
         s = pts.sum(axis=1)
         d = np.diff(pts, axis=1).reshape(-1)
         tl = pts[np.argmin(s)]
         br = pts[np.argmax(s)]
         tr = pts[np.argmin(d)]
         bl = pts[np.argmax(d)]
-        src = np.array([tl, tr, br, bl], dtype=np.float32)
-        dst = np.array([[0, 0], [tw - 1, 0],
-                        [tw - 1, th - 1], [0, th - 1]], dtype=np.float32)
+        return np.array([tl, tr, br, bl], dtype=np.float32)
+
+    def _warp_tile_upright(self, frame: np.ndarray,
+                           rot_rect: tuple,
+                           contour: Optional[np.ndarray] = None) -> np.ndarray:
+        """
+        Warp the tile to an upright target_size × target_size square.
+
+        Uses the contour's actual 4 corners (via _find_tile_quad), NOT the
+        minAreaRect bounding rectangle. This gives a tight hug on tiles
+        that aren't perfect rectangles (chamfered corners, perspective
+        skew, slight bowing).
+
+        Falls back to the rotated rect's corners only if no contour is given.
+        """
+        S = int(self.target_size)
+
+        if contour is not None:
+            src = self._find_tile_quad(contour, rot_rect)
+        else:
+            box = cv2.boxPoints(rot_rect).astype(np.float32)
+            src = self._order_quad(box)
+
+        # Optional outward expansion along the diagonals from the quad's
+        # centroid. Default crop_pad_ratio=0 → pure tight hug.
+        if self.crop_pad_ratio > 0:
+            centroid = src.mean(axis=0)
+            src = centroid + (src - centroid) * (1.0 + self.crop_pad_ratio)
+
+        dst = np.array([[0, 0], [S - 1, 0],
+                        [S - 1, S - 1], [0, S - 1]], dtype=np.float32)
 
         M = cv2.getPerspectiveTransform(src, dst)
-        return cv2.warpPerspective(frame, M, (tw, th),
-                                   flags=cv2.INTER_LINEAR)
+        warped = cv2.warpPerspective(frame, M, (S, S),
+                                     flags=cv2.INTER_LINEAR)
+
+        if contour is not None:
+            # Mask anything outside the tile's true outline so the model
+            # sees a clean tile-only image (no conveyor bleed at edges).
+            H, W = frame.shape[:2]
+            cnt_mask = np.zeros((H, W), dtype=np.uint8)
+            cv2.drawContours(cnt_mask, [contour], -1, 255, thickness=cv2.FILLED)
+            cnt_mask_warped = cv2.warpPerspective(cnt_mask, M, (S, S),
+                                                  flags=cv2.INTER_NEAREST)
+            warped = cv2.bitwise_and(warped, warped, mask=cnt_mask_warped)
+
+        return warped
 
     @staticmethod
     def _iou(a: tuple, b: tuple) -> float:
@@ -235,6 +387,23 @@ class AnomalyDetectorNode(Node):
         inter = iw * ih
         union = aw * ah + bw * bh - inter
         return inter / union if union > 0 else 0.0
+
+    def _overlaps_center(self, rot_rect: tuple, frame_width: int,
+                         frame_height: int) -> bool:
+        """
+        True when the tile's rotated rect shares any area with the central
+        vertical band of the frame.  The band is `center_band_ratio` wide
+        (as a fraction of frame width), centered on x = frame_width / 2.
+        """
+        band_w = max(1.0, self.center_band_ratio * frame_width)
+        center_band = (
+            (frame_width * 0.5, frame_height * 0.5),
+            (band_w, float(frame_height)),
+            0.0,
+        )
+        retval, _ = cv2.rotatedRectangleIntersection(rot_rect, center_band)
+        # retval is INTERSECT_NONE (0), INTERSECT_PARTIAL (1), or INTERSECT_FULL (2)
+        return retval != cv2.INTERSECT_NONE
 
     @staticmethod
     def _to_numpy(x):
@@ -289,11 +458,12 @@ class AnomalyDetectorNode(Node):
             return
 
         # Detect once per frame; reuse result for tracking + preview.
-        rot_rect, aabb = self._detect_tile(self.latest_frame)
+        rot_rect, aabb, contour = self._detect_tile(self.latest_frame)
 
         status = 'searching'
         if self.auto_scan:
-            status = self._tick_auto_scan(self.latest_frame, rot_rect, aabb)
+            status = self._tick_auto_scan(
+                self.latest_frame, rot_rect, aabb, contour)
 
         if self.show_debug:
             self._show_live(self.latest_frame, rot_rect, aabb, status)
@@ -302,7 +472,8 @@ class AnomalyDetectorNode(Node):
 
     def _tick_auto_scan(self, frame: np.ndarray,
                         rot_rect: Optional[tuple],
-                        aabb: Optional[tuple]) -> str:
+                        aabb: Optional[tuple],
+                        contour: Optional[np.ndarray]) -> str:
         """
         Advance the auto-scan state machine for one frame.
 
@@ -324,21 +495,55 @@ class AnomalyDetectorNode(Node):
         # A tile is visible -----------------------------------------------------
         self._miss_count = 0
 
-        # Still waiting for the previous tile to be removed - do nothing.
+        H, W = frame.shape[:2]
+        centered = self._overlaps_center(rot_rect, W, H)
+
+        # Re-arm path: we previously inspected a tile and have been waiting
+        # for the conveyor to move it past the center. As soon as no tile is
+        # overlapping the center band (even if the inspected tile is still
+        # in the frame, just past center), we're ready for the next one.
+        # We also drop the IoU tracker so the *next* tile entering doesn't
+        # accidentally match the just-cleared one's position.
         if self._awaiting_clear:
-            return 'already inspected (remove tile)'
+            if not centered:
+                self.get_logger().info(
+                    'Center cleared - ready for next inspection')
+                self._awaiting_clear = False
+                self._tracked_box    = None
+                self._tracked_aabb   = None
+                self._stable_count   = 0
+                # Fall through to normal handling below for THIS new tile,
+                # if it happens to already be a different one centered.
+                # (Usually it isn't — the just-inspected tile is past center.)
+            else:
+                return 'already inspected (remove tile)'
+
+        # Centering gate: the tile's rotated rect must overlap the central
+        # vertical band of the frame. We still track the tile (to know it's
+        # the same one), but we don't accumulate "stable" frames until any
+        # part of it has crossed into the band. (`centered` already computed
+        # above.)
 
         # First sighting, or different tile -> reset tracker.
         if self._tracked_aabb is None or \
            self._iou(aabb, self._tracked_aabb) < self.stable_iou:
             self._tracked_box  = rot_rect
             self._tracked_aabb = aabb
-            self._stable_count = 1
+            self._stable_count = 1 if centered else 0
+            if not centered:
+                return 'waiting for center'
             return f'tracking 1/{self.stable_frames}'
 
-        # Same tile as last frame -> increment stability.
+        # Same tile as last frame.
         self._tracked_box  = rot_rect       # keep latest pose
         self._tracked_aabb = aabb
+
+        if not centered:
+            # Hold stability counter at 0 while the tile drifts through
+            # the frame — fire only once it's actually in the window.
+            self._stable_count = 0
+            return 'waiting for center'
+
         self._stable_count += 1
 
         if self._stable_count < self.stable_frames:
@@ -350,7 +555,8 @@ class AnomalyDetectorNode(Node):
             f'Auto-inspect: tile_id={self._auto_tile_id} stable for '
             f'{self._stable_count} frames')
         try:
-            self._inspect_with_rect(self._auto_tile_id, frame, rot_rect, aabb)
+            self._inspect_with_rect(
+                self._auto_tile_id, frame, rot_rect, aabb, contour)
         except Exception as e:
             self.get_logger().error(
                 f'Auto-inspect failed: {e}')
@@ -369,6 +575,18 @@ class AnomalyDetectorNode(Node):
         """Show the camera feed with the (rotated) candidate tile overlay."""
         try:
             preview = frame.copy()
+            H, W = preview.shape[:2]
+
+            # Draw the central trigger band (any tile pixel inside this
+            # vertical band fires the inspection).
+            band_w = max(1.0, self.center_band_ratio * W)
+            lo_x = int(W * 0.5 - band_w * 0.5)
+            hi_x = int(W * 0.5 + band_w * 0.5)
+            band = preview.copy()
+            cv2.rectangle(band, (lo_x, 0), (hi_x, H), (0, 200, 200), -1)
+            preview = cv2.addWeighted(preview, 0.85, band, 0.15, 0)
+            cv2.line(preview, (lo_x, 0), (lo_x, H), (0, 200, 200), 1)
+            cv2.line(preview, (hi_x, 0), (hi_x, H), (0, 200, 200), 1)
 
             if rot_rect is not None:
                 box = cv2.boxPoints(rot_rect).astype(np.int32)
@@ -407,7 +625,7 @@ class AnomalyDetectorNode(Node):
 
         frame   = self.latest_frame.copy()
         tile_id = request.tile_id
-        rot_rect, aabb = self._detect_tile(frame)
+        rot_rect, aabb, contour = self._detect_tile(frame)
 
         if rot_rect is None:
             self.get_logger().warn(
@@ -418,7 +636,8 @@ class AnomalyDetectorNode(Node):
             return response
 
         try:
-            result = self._inspect_with_rect(tile_id, frame, rot_rect, aabb)
+            result = self._inspect_with_rect(
+                tile_id, frame, rot_rect, aabb, contour)
             response.success          = True
             response.anomaly_detected = result['anomaly_detected']
             response.defect_score     = result['defect_score']
@@ -434,13 +653,15 @@ class AnomalyDetectorNode(Node):
     # ── shared inference path ──────────────────────────────────────────────────
 
     def _inspect_with_rect(self, tile_id: int, frame: np.ndarray,
-                           rot_rect: tuple, aabb: tuple) -> dict:
+                           rot_rect: tuple, aabb: tuple,
+                           contour: Optional[np.ndarray] = None) -> dict:
         """
-        Warp the tile upright, run anomalib, report, and (optionally) show
-        the inspection popup.  Returns a dict with anomaly_detected and
-        defect_score.  Raises on inference failure.
+        Warp the tile upright at target_size × target_size, run anomalib,
+        report, save defectives, and (optionally) show the inspection popup.
+        Returns a dict with anomaly_detected and defect_score.
+        Raises on inference failure.
         """
-        tile_crop = self._warp_tile_upright(frame, rot_rect)
+        tile_crop = self._warp_tile_upright(frame, rot_rect, contour)
         self.get_logger().info(
             f'Tile {tile_id}: warped to '
             f'{tile_crop.shape[1]}x{tile_crop.shape[0]}  '
@@ -451,12 +672,21 @@ class AnomalyDetectorNode(Node):
         defect_score     = float(pred.pred_score)
 
         mask_u8 = self._mask_to_uint8(pred)
+        # Anomalib may return the mask at the model's native input size; align
+        # it to the saved tile so the two images overlay 1:1.
+        if mask_u8.shape[:2] != tile_crop.shape[:2]:
+            mask_u8 = cv2.resize(mask_u8,
+                                 (tile_crop.shape[1], tile_crop.shape[0]),
+                                 interpolation=cv2.INTER_NEAREST)
 
         self.get_logger().info(
             f'Tile {tile_id}: {"NOK" if anomaly_detected else "OK"}  '
             f'score={defect_score:.4f}')
 
         self._send_to_report(tile_id, tile_crop, mask_u8, anomaly_detected)
+
+        if anomaly_detected:
+            self._save_defective(tile_id, tile_crop, mask_u8, defect_score)
 
         if self.show_debug:
             self._show_debug(tile_id, frame, rot_rect, aabb, tile_crop,
@@ -466,6 +696,29 @@ class AnomalyDetectorNode(Node):
             'anomaly_detected': anomaly_detected,
             'defect_score':     defect_score,
         }
+
+    # ── saving defectives ──────────────────────────────────────────────────────
+
+    def _save_defective(self, tile_id: int, tile_crop: np.ndarray,
+                        mask_u8: np.ndarray, defect_score: float) -> None:
+        """Write the warped tile and its binary defect mask to save_dir."""
+        try:
+            ts = datetime.now().strftime('%Y%m%d_%H%M%S_%f')[:-3]
+            stem = f'tile_{tile_id:04d}_{ts}_score{defect_score:.3f}'
+            tile_path = os.path.join(self.save_dir, f'{stem}.png')
+            mask_path = os.path.join(self.save_dir, f'{stem}_mask.png')
+
+            ok_tile = cv2.imwrite(tile_path, tile_crop)
+            ok_mask = cv2.imwrite(mask_path, mask_u8)
+
+            if ok_tile and ok_mask:
+                self.get_logger().info(
+                    f'Saved defective tile + mask -> {tile_path}')
+            else:
+                self.get_logger().warn(
+                    f'cv2.imwrite reported failure for {tile_path} / {mask_path}')
+        except Exception as e:
+            self.get_logger().error(f'Failed to save defective tile: {e}')
 
     # ── reporting ──────────────────────────────────────────────────────────────
 
