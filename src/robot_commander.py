@@ -443,28 +443,24 @@ def main(args=None):
     # "yaw" == 5 : dol-desno
     # "yaw" == 6 : gor-levo
     # "yaw" == 7 : dol-levo
+    # "yaw" == 8 : obrat na mestu
     
     koordinate = [
-        (0, 0.0, 0.0, 1),
-        (1, 1.3, 1.8, 4),
-        (2, 0.5, 2.75, 1),
-        (3, -1.5, 2.5, 0),
-        (3, -1.5, 2.5, 7),
-        (4, -2.6, 2.75, 4),
-        (4.5, -2.5, 0.4, 0),
-        (5, -1.9, -0.45, 3),
-        (6, -1.85, -1.3, 3),
-        (6, -1.85, -1.3, 2),
-        (6.5, -1.2, -1.3, 1),
-        (6.5, -1.2, -2.5, 0),
-        (7, 0.0, -1.6, 3),
-        (7.5, 0.6, -3.8, 0),
-        (8, 1.4, -2.5, 2),
-        (8, 1.4, -2.5, 1),
-        (9, 2.55, -1.3, 2),
-        (10, 1.0, 0.3, 1),
-        (10.5, -0.4, 1.2, 2),
-        (11, -1.75, -0.3, 3)
+        (1, 0.2, -0.5, 8),
+        (2, 0.85, -2.0, 8),
+        (3, 0.0, -3.7, 3),
+        (3, 0.0, -3.7, 0),
+        (4, 0.9, -4.48, 3),
+        (5, -2.5, -4.6, 8),
+        (6, -1.18, -1.8, 8),
+        (7, -1.5, -0.93, 3),
+        (8, -2.9, -2.85, 8),
+        (9, -4.2, -1.8, 8),
+        (10, -4.3, 0.425, 8),
+        (11, -3.3, -0.5, 1),
+        (12, -1.15, 0.35, 8),
+        (13, 1.5, 0.25, 8),
+        (14, 3.05, -0.45, 8)
     ]
     
     #---------------------------------------------------------------------
@@ -492,6 +488,11 @@ def main(args=None):
             goal_pose.pose.orientation = rc.YawToQuaternion(0.785)
         elif yaw == 7: # dol-levo
             goal_pose.pose.orientation = rc.YawToQuaternion(2.356)
+        elif yaw == 8: # obrat na mestu
+            if hasattr(rc, 'current_pose'):
+                goal_pose.pose.orientation = rc.current_pose.pose.orientation
+            else:
+                goal_pose.pose.orientation = rc.YawToQuaternion(0)
 
         rc.goToPose(goal_pose)
 
@@ -499,6 +500,13 @@ def main(args=None):
         while not rc.isTaskComplete():
             #rc.info("Waiting for the task to complete...")
             time.sleep(1)
+
+        if yaw == 8:
+            rc.spin(2 * np.pi, time_allowance=20)
+
+            rc.info("Waiting for the spin to complete...")
+            while not rc.isTaskComplete():
+                time.sleep(1)
     
     time.sleep(2)
     #-----------------------------------------------------------------
