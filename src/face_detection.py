@@ -75,6 +75,8 @@ class detect_faces(Node):
 		self.classificationClient = self.create_client(FaceRecognition,"/classify_face")
 		self.pendingBBox = None
 		self.currentBBox = None
+		self.last_person = "NONE"
+		self.last_gender = "NONE"
 		#---------------------------------------------------------------------------------
 
 		#---------------------------------------------------------------------------------
@@ -338,7 +340,7 @@ class detect_faces(Node):
 				pub.points.append(face)
 		self.coordPublisher.publish(pub)
 
-	def sendBoundingBox(self,req,res):
+	def sendBoundingBox(self, req, res):
 		if self.currentBBox is not None:
 			request = FaceRecognition.Request()
 			try:
@@ -346,23 +348,30 @@ class detect_faces(Node):
 			except Exception:
 				request.bbox = list(self.currentBBox)
 
+			# Make async call with callback - don't block
 			future = self.classificationClient.call_async(request)
-			rclpy.spin_until_future_complete(self, future)
-			response = future.result()
-			if response is not None:
-				self.get_logger().info("Received classification from face_classifier!")
-				res.person = response.person
-				res.gender = response.gender
-			else:
-				self.get_logger().info("DID NOT receive classification from face_classifier!")
-				res.person = "NONE"
-				res.gender = "NONE"
-			return res
+			future.add_done_callback(self._classification_done_callback)
+			
+			# Return immediately with cached result from previous classification
+			res.person = self.last_person
+			res.gender = self.last_gender
 		else:
 			self.get_logger().info("Could not send BBox, there is none!")
 			res.person = "NONE"
 			res.gender = "NONE"
-			return res
+		return res
+
+	def _classification_done_callback(self, future):
+		try:
+			response = future.result()
+			if response is not None:
+				self.last_person = response.person
+				self.last_gender = response.gender
+				self.get_logger().info(f"Received classification: {response.person} ({response.gender})")
+			else:
+				self.get_logger().warn("Empty response from face_classifier")
+		except Exception as e:
+			self.get_logger().error(f"Service call to face_classifier failed: {e}")
 
 
 def main():

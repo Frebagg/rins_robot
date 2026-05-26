@@ -2,12 +2,12 @@
 
 import json
 import os
-import tempfile
 import datetime
 
 import rclpy
 from rclpy.node import Node
 from rclpy.qos import qos_profile_sensor_data
+from ament_index_python.packages import get_package_share_directory
 from sensor_msgs.msg import Image
 from cv_bridge import CvBridge, CvBridgeError
 import cv2
@@ -38,6 +38,9 @@ class FaceClassifier(Node):
         # keep last camera frame so we can crop it when a bbox request arrives
         self.bridge = CvBridge()
         self.latest_cv_image = None
+        self.crop_output_dir = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))), "tmp", "face_crops")
+        os.makedirs(self.crop_output_dir, exist_ok=True)
+        self.get_logger().info(f"Face crops will be saved to {self.crop_output_dir}")
         self.image_sub = self.create_subscription(Image,
                                                  "/oakd/rgb/preview/image_raw",
                                                  self.image_callback,
@@ -47,16 +50,30 @@ class FaceClassifier(Node):
         self.get_logger().info("Face classifier service node initialized!")
 
     def load_face_database(self):
-        base_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-        db_path = os.path.join(base_dir, "face_db.json")
+        package_share_dir = get_package_share_directory("rins_robot")
+        candidate_paths = [
+            os.path.join(package_share_dir, "face_db.json"),
+            os.path.join(os.path.dirname(package_share_dir), "face_db.json"),
+            os.path.join(os.path.dirname(os.path.dirname(package_share_dir)), "face_db.json"),
+        ]
 
-        if not os.path.exists(db_path):
-            self.get_logger().warn(f"Face database not found at {db_path}")
+        db_path = None
+        for candidate_path in candidate_paths:
+            self.get_logger().debug(f"Checking face database path: {candidate_path}")
+            if os.path.exists(candidate_path):
+                db_path = candidate_path
+                break
+
+        if db_path is None:
+            self.get_logger().error(
+                "Face database not found. Looked in: " + ", ".join(candidate_paths)
+            )
             return []
 
         try:
             with open(db_path, "r", encoding="utf-8") as f:
                 database = json.load(f)
+            self.get_logger().info(f"Loaded face database from {db_path} with {len(database)} raw entries")
         except Exception as e:
             self.get_logger().error(f"Could not load face database from {db_path}: {e}")
             return []
@@ -70,6 +87,8 @@ class FaceClassifier(Node):
             norm = np.linalg.norm(embedding)
             if norm > 0:
                 embedding = embedding / norm
+            else:
+                self.get_logger().warn(f"Entry {entry['name']} has zero-norm embedding")
 
             normalized_db.append({
                 "name": entry["name"],
@@ -77,15 +96,17 @@ class FaceClassifier(Node):
                 "embedding": embedding,
             })
 
-        self.get_logger().info(f"Loaded {len(normalized_db)} face embeddings from {db_path}")
+        self.get_logger().info(f"Normalized and loaded {len(normalized_db)} face embeddings")
         return normalized_db
 
     def recognize_face(self, crop):
         if crop is None or crop.size == 0:
+            self.get_logger().info("Recognition result: person=NONE, gender=NONE, score=0.0000")
             return "NONE", "NONE"
 
         faces = self.face_app.get(crop)
         if len(faces) == 0:
+            self.get_logger().info("Recognition result: person=UNKNOWN, gender=UNKNOWN, score=0.0000")
             return "UNKNOWN", "UNKNOWN"
 
         face = max(faces, key=lambda x: (x.bbox[2] - x.bbox[0]) * (x.bbox[3] - x.bbox[1]))
@@ -97,15 +118,20 @@ class FaceClassifier(Node):
         best_match = None
         best_score = -1.0
 
+        self.get_logger().debug(f"Comparing against {len(self.face_db)} database entries")
+
         for entry in self.face_db:
             score = float(np.dot(embedding, entry["embedding"]))
+            self.get_logger().debug(f"Candidate {entry['name']} ({entry['gender']}): score={score:.4f}")
             if score > best_score:
                 best_score = score
                 best_match = entry
 
         if best_match is None or best_score < self.match_threshold:
+            self.get_logger().info(f"No good match! person=UNKNOWN, gender=UNKNOWN, score={best_score:.4f}, candidates={len(self.face_db)}")
             return "UNKNOWN", "UNKNOWN"
 
+        self.get_logger().info(f"Recognition result: person={best_match['name']}, gender={best_match['gender']}, score={best_score:.4f}")
         return best_match["name"], best_match["gender"]
 
     def image_callback(self, msg: Image):
@@ -167,8 +193,7 @@ class FaceClassifier(Node):
 
         # For now: persist crop to temp dir for debugging and return placeholder
         try:
-            tmp = tempfile.gettempdir()
-            fname = os.path.join(tmp, f"face_crop_{datetime.datetime.now().strftime('%Y%m%d_%H%M%S_%f')}.jpg")
+            fname = os.path.join(self.crop_output_dir, f"face_crop_{datetime.datetime.now().strftime('%Y%m%d_%H%M%S_%f')}.jpg")
             cv2.imwrite(fname, crop)
             self.get_logger().info(f"Saved face crop to {fname}")
         except Exception as e:
@@ -177,6 +202,7 @@ class FaceClassifier(Node):
         person, gender = self.recognize_face(crop)
         res.person = person
         res.gender = gender
+        self.get_logger().info(f"Returning response: person={person}, gender={gender}")
         return res
 
 

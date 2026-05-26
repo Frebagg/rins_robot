@@ -15,6 +15,8 @@ rosidl_generate_interfaces(${PROJECT_NAME}
   "msg/CylinderCoords.msg"
   "srv/Speech.srv"
   "srv/FaceDialogue.srv"
+  "srv/FaceRecognition.srv"
+  "srv/BoundingBox.srv"
   DEPENDENCIES geometry_msgs
 )
 
@@ -25,13 +27,25 @@ install(DIRECTORY
   maps
   urdf
   models
-  docs
   DESTINATION share/${PROJECT_NAME}/
 )
+
+install(FILES
+  face_db.json
+  DESTINATION share/${PROJECT_NAME}
+)
+
+if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/docs")
+  install(DIRECTORY
+    docs
+    DESTINATION share/${PROJECT_NAME}/
+  )
+endif()
 
 install(PROGRAMS
   src/face_detection.py
   src/face_dialogue_servicer.py
+  src/face_classifier.py
   src/ring_detector.py
   src/cylinder_detection.py
   src/capture_cylinder_dataset.py
