@@ -44,6 +44,7 @@ from rins_robot.msg import FaceCoords
 from rins_robot.msg import RingCoords
 from rins_robot.srv import BoundingBox
 from rins_robot.srv import FaceDialogue
+from rins_robot.srv import GenerateReport
 from rins_robot.srv import ReportTaskAssignment
 from rins_robot.srv import Speech
 from std_srvs.srv import SetBool
@@ -117,6 +118,7 @@ class RobotCommander(Node):
         self.boundingBoxClient = self.create_client(BoundingBox,"/bounding_box_service")
         self.faceDialogueClient = self.create_client(FaceDialogue,"/face_dialogue_service")
         self.reportTaskClient = self.create_client(ReportTaskAssignment,"/report_task_assignment")
+        self.generateReportClient = self.create_client(GenerateReport, '/generate_report')
         self.anomalyClient = self.create_client(SetBool, '/set_auto_scan')
 
         self.faces = []
@@ -875,6 +877,30 @@ class RobotCommander(Node):
         response = future.result()
         return response is not None and response.success
 
+    def generateReport(self, robot_name="", output_path=""):
+        if not self.generateReportClient.wait_for_service(timeout_sec=2.0):
+            self.warn("/generate_report is not available.")
+            return False
+
+        request = GenerateReport.Request()
+        request.robot_name = robot_name
+        request.output_path = output_path
+
+        future = self.generateReportClient.call_async(request)
+        rclpy.spin_until_future_complete(self, future)
+        response = future.result()
+
+        if response is None:
+            self.warn("Report generation call failed.")
+            return False
+
+        if response.success:
+            self.info(f"Report saved: {response.pdf_path}")
+            return True
+
+        self.warn(f"Report generation failed: {response.message}")
+        return False
+
     def collectTasksFromFaces(self):
         self.spinSome(1.0)
         facesCopy = self.faces.copy()
@@ -1095,6 +1121,9 @@ def main(args=None):
     # Za rocni test anomaly premika odkomentiraj eno vrstico:
     # rc.runRedAnomalyMovement()
     # rc.runGreenAnomalyMovement()
+
+    rc.info("Generating report before returning to the last coordinate...")
+    rc.generateReport()
 
     # Return to the last coordinate after all tasks are complete
     rc.info("Returning to the last coordinate...")

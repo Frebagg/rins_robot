@@ -41,7 +41,6 @@ from rclpy.node import Node
 from rclpy.qos import qos_profile_sensor_data
 from sensor_msgs.msg import Image
 from rins_robot.msg import FaceCoords
-from rins_robot.srv import GenerateReport
 
 # ---------------------------------------------------------------------------
 # Camera / topic configuration
@@ -197,7 +196,6 @@ class LineFollower(Node):
             FaceCoords, '/face_coords', self._face_coords_cb, 10)
 
         self._cmd_pub = self.create_publisher(TwistStamped, CMD_VEL_TOPIC, 10)
-        self._report_client = self.create_client(GenerateReport, '/generate_report')
 
         # Fast timer for non-vision states (TURNING)
         self.create_timer(0.05, self._control_timer_cb)  # 20 Hz
@@ -206,7 +204,6 @@ class LineFollower(Node):
         self._state: State = State.FOLLOWING
         self._new_face_detected = False
         self._shutdown_requested = False
-        self._report_future = None
 
         # PID
         self._pid_error_prev = 0.0
@@ -252,21 +249,7 @@ class LineFollower(Node):
     def _control_timer_cb(self):
         """Runs at 20 Hz independently of camera. Handles non-vision states."""
         if self._shutdown_requested:
-            if self._report_future is None:
-                if self._report_client.service_is_ready():
-                    req = GenerateReport.Request()
-                    self._report_future = self._report_client.call_async(req)
-                    self.get_logger().info('Calling /generate_report …')
-                else:
-                    self.get_logger().warn('/generate_report not available — skipping report')
-                    raise SystemExit
-            elif self._report_future.done():
-                result = self._report_future.result()
-                if result.success:
-                    self.get_logger().info(f'Report saved: {result.pdf_path}')
-                else:
-                    self.get_logger().error(f'Report failed: {result.message}')
-                raise SystemExit
+            raise SystemExit
             return
         if self._state == State.TURNING:
             self._do_turning()
@@ -307,7 +290,7 @@ class LineFollower(Node):
         # Obstacle ahead → check for face first, else 180° turn
         if self._obstacle_ahead(depth, h, w):
             if self._new_face_detected:
-                self.get_logger().info('Face detected at end of segment → generating report and shutting down')
+                self.get_logger().info('Face detected at end of segment -> shutting down')
                 self._stop()
                 self._state = State.DONE
                 self._shutdown_requested = True

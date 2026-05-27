@@ -72,9 +72,10 @@ ros2 run rins_robot face_classifier.py
 ros2 run rins_robot face_dialogue_servicer.py
 ros2 run rins_robot speech_servicer.py
 ros2 run rins_robot ring_detector.py
-ros2 launch rins_robot cylinder_detection_yolo.launch.py device:=0 confidence_threshold:=0.85 max_fps:=8.0
+ros2 launch rins_robot cylinder_detection_yolo.launch.py device:=0 confidence_threshold:=0.90 max_fps:=8.0
 ros2 run rins_robot visualiser.py
 ros2 run rins_robot arm_mover_actions.py
+ros2 run rins_robot report_generator.py
 ros2 run rins_robot anomaly_detector.py
 ali
 TRUST_REMOTE_CODE=1 ros2 run rins_robot anomaly_detector.py --ros-args \
