@@ -16,6 +16,7 @@
 
 from enum import Enum
 import math
+import subprocess
 import time
 
 from action_msgs.msg import GoalStatus
@@ -121,6 +122,9 @@ class RobotCommander(Node):
         self.last_face_coords_time = None
         #-----------------------------------------------------------------------------------------
         
+        # Child process tracking for graceful shutdown
+        self.line_follower_process = None
+        
         # ROS2 publishers
         self.initial_pose_pub = self.create_publisher(PoseWithCovarianceStamped, 'initialpose', 10)
         self.arm_command_pub = self.create_publisher(String, '/arm_command', 10)
@@ -135,8 +139,24 @@ class RobotCommander(Node):
         self.get_logger().info(f"NEW Robot commander has been initialized!")
         
     def destroyNode(self):
+        self._cleanup_child_processes()
         self.nav_to_pose_client.destroy()
-        super().destroy_node()     
+        super().destroy_node()
+    
+    def _cleanup_child_processes(self):
+        """Gracefully terminate any child processes (e.g., line_follower)."""
+        if self.line_follower_process is not None:
+            if self.line_follower_process.poll() is None:  # Still running
+                self.info(f"Terminating line_follower (PID {self.line_follower_process.pid})...")
+                try:
+                    self.line_follower_process.terminate()
+                    self.line_follower_process.wait(timeout=2.0)
+                    self.info("line_follower terminated gracefully.")
+                except subprocess.TimeoutExpired:
+                    self.warn("line_follower did not terminate in time, killing forcefully...")
+                    self.line_follower_process.kill()
+                    self.line_follower_process.wait()
+            self.line_follower_process = None     
 
     def goToPose(self, pose, behavior_tree=''):
         """Send a `NavToPose` action request."""
@@ -978,7 +998,7 @@ def main(args=None):
     # "yaw" == 8 : obrat na mestu
     # "yaw" == 9 : direktno naravnost do tocke brez Nav2 plannerja
     
-    koordinate = [
+    """koordinate = [
         (1, 0.2, -0.5, 8),
         (2, 0.85, -2.0, 8),
         (3, 0.0, -3.7, 3),
@@ -1046,7 +1066,7 @@ def main(args=None):
             while not rc.isTaskComplete():
                 time.sleep(1)
     
-    time.sleep(2)
+    time.sleep(2)"""
     #-----------------------------------------------------------------
     #DRUGI KROG - POGOVORI IN IZVAJANJE TASKOV
     rc.info("Going to collect face tasks and execute them")
@@ -1056,6 +1076,37 @@ def main(args=None):
     # rc.runRedAnomalyMovement()
     # rc.runGreenAnomalyMovement()
 
+    # Return to the last coordinate after all tasks are complete
+    rc.info("Returning to the last coordinate...")
+    goal_pose = PoseStamped()
+    goal_pose.header.frame_id = 'map'
+    goal_pose.header.stamp = rc.get_clock().now().to_msg()
+    goal_pose.pose.position.x = 3.05
+    goal_pose.pose.position.y = -0.45
+    goal_pose.pose.orientation = rc.current_pose.pose.orientation if hasattr(rc, 'current_pose') else rc.YawToQuaternion(0)
+    
+    rc.goToPose(goal_pose)
+    
+    rc.info("Waiting for return navigation to complete...")
+    while not rc.isTaskComplete():
+        time.sleep(1)
+
+    rc.info("Turning 70 degrees to the right")
+    rc.spin(-np.deg2rad(70), time_allowance=10)
+
+    rc.info("Waiting for final turn to complete...")
+    while not rc.isTaskComplete():
+        time.sleep(1)
+
+    rc.info("Moving arm to line-following pose...")
+    rc.setArmPosition("lines")
+
+    rc.info("Starting line_follower for line navigation...")
+    rc.line_follower_process = subprocess.Popen([
+        "ros2", "run", "rins_robot", "line_follower.py"
+    ])
+    rc.info(f"line_follower started with PID {rc.line_follower_process.pid}")
+    
     rc.info("Finishing, give good grade!")
     #-------------------------------------------------------------------
 
