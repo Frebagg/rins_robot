@@ -230,3 +230,4 @@ __marimo__/
 
 models/anomaly_model.pt
 RINS_AD_dataset/
+ultralytics_venv/
