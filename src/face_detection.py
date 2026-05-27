@@ -1,5 +1,7 @@
 #!/usr/bin/env python3
 
+import json
+import os
 import rclpy
 from rclpy.node import Node
 from rclpy.qos import qos_profile_sensor_data, QoSReliabilityPolicy
@@ -18,16 +20,17 @@ from tf2_ros.buffer import Buffer
 from tf2_ros.transform_listener import TransformListener
 from geometry_msgs.msg import PointStamped
 from rclpy.duration import Duration
+from ament_index_python.packages import get_package_share_directory
 from rins_robot.msg import FaceCoords
 from geometry_msgs.msg import Point
 import time
 
 from rins_robot.srv import BoundingBox
-from rins_robot.srv import FaceRecognition
 
 
 from ultralytics import YOLO
 import torch
+from insightface.app import FaceAnalysis
 
 # from rclpy.parameter import Parameter
 # from rcl_interfaces.msg import SetParametersResult
@@ -69,14 +72,22 @@ class detect_faces(Node):
 		self.coordPublisher = self.create_publisher(FaceCoords, "/face_coords", 10)
 		self.publishTimer = self.create_timer(1/5,self.publishFaces_callback)
 
+		self.match_threshold = 0.45
+		self.face_db = self.load_face_database()
+		providers = ["CPUExecutionProvider"]
+		ctx_id = -1
+		if torch.cuda.is_available():
+			providers = ["CUDAExecutionProvider", "CPUExecutionProvider"]
+			ctx_id = 0
+		self.face_app = FaceAnalysis(name="buffalo_l", providers=providers)
+		self.face_app.prepare(ctx_id=ctx_id)
+
 		#---------------------------------------------------------------------------------
 		#SPREMENLJIVKE ZA PREPOZNAVANJE OSEB
-		self.requestClassification = self.create_service(BoundingBox,"/bounding_box_service",self.sendBoundingBox)
-		self.classificationClient = self.create_client(FaceRecognition,"/classify_face")
+		self.requestClassification = self.create_service(BoundingBox, "/bounding_box_service", self.sendBoundingBox)
 		self.pendingBBox = None
 		self.currentBBox = None
-		self.last_person = "NONE"
-		self.last_gender = "NONE"
+		self.currentImage = None
 		#---------------------------------------------------------------------------------
 
 		#---------------------------------------------------------------------------------
@@ -129,6 +140,7 @@ class detect_faces(Node):
 						bestBbox = vertices
 
 						self.pendingBBox = vertices #kandidat za bbox
+						self.currentImage = cvImage.copy()
 						
 						bestCenter = (cx, cy)
 					
@@ -340,38 +352,105 @@ class detect_faces(Node):
 				pub.points.append(face)
 		self.coordPublisher.publish(pub)
 
-	def sendBoundingBox(self, req, res):
-		if self.currentBBox is not None:
-			request = FaceRecognition.Request()
-			try:
-				request.bbox = [int(float(v)) for v in self.currentBBox]
-			except Exception:
-				request.bbox = list(self.currentBBox)
+	def load_face_database(self):
+		package_share_dir = get_package_share_directory("rins_robot")
+		candidate_paths = [
+			os.path.join(package_share_dir, "face_db.json"),
+			os.path.join(os.path.dirname(package_share_dir), "face_db.json"),
+			os.path.join(os.path.dirname(os.path.dirname(package_share_dir)), "face_db.json"),
+		]
 
-			# Make async call with callback - don't block
-			future = self.classificationClient.call_async(request)
-			future.add_done_callback(self._classification_done_callback)
-			
-			# Return immediately with cached result from previous classification
-			res.person = self.last_person
-			res.gender = self.last_gender
+		db_path = None
+		for candidate_path in candidate_paths:
+			if os.path.exists(candidate_path):
+				db_path = candidate_path
+				break
+
+		if db_path is None:
+			self.get_logger().error("Face database not found. Looked in: " + ", ".join(candidate_paths))
+			return []
+
+		try:
+			with open(db_path, "r", encoding="utf-8") as f:
+				database = json.load(f)
+		except Exception as e:
+			self.get_logger().error(f"Could not load face database from {db_path}: {e}")
+			return []
+
+		normalized_db = []
+		for entry in database:
+			if "name" not in entry or "gender" not in entry or "embedding" not in entry:
+				continue
+
+			embedding = np.asarray(entry["embedding"], dtype=np.float32)
+			norm = np.linalg.norm(embedding)
+			if norm > 0:
+				embedding = embedding / norm
+			normalized_db.append({
+				"name": entry["name"],
+				"gender": entry["gender"],
+				"embedding": embedding,
+			})
+
+		self.get_logger().info(f"Loaded {len(normalized_db)} face embeddings")
+		return normalized_db
+
+	def recognize_face(self, crop):
+		if crop is None or crop.size == 0:
+			return "NONE", "NONE"
+
+		faces = self.face_app.get(crop)
+		if len(faces) == 0:
+			return "UNKNOWN", "UNKNOWN"
+
+		face = max(faces, key=lambda x: (x.bbox[2] - x.bbox[0]) * (x.bbox[3] - x.bbox[1]))
+		embedding = np.asarray(face.embedding, dtype=np.float32)
+		norm = np.linalg.norm(embedding)
+		if norm > 0:
+			embedding = embedding / norm
+
+		best_match = None
+		best_score = -1.0
+		for entry in self.face_db:
+			score = float(np.dot(embedding, entry["embedding"]))
+			if score > best_score:
+				best_score = score
+				best_match = entry
+
+		if best_match is None or best_score < self.match_threshold:
+			return "UNKNOWN", "UNKNOWN"
+
+		return best_match["name"], best_match["gender"]
+
+	def sendBoundingBox(self, req, res):
+		if self.currentBBox is not None and self.currentImage is not None:
+			try:
+				x1, y1, x2, y2 = [int(float(v)) for v in self.currentBBox]
+			except Exception:
+				x1, y1, x2, y2 = list(self.currentBBox)
+
+			h, w = self.currentImage.shape[:2]
+			x1 = max(0, min(w - 1, x1))
+			x2 = max(0, min(w, x2))
+			y1 = max(0, min(h - 1, y1))
+			y2 = max(0, min(h, y2))
+
+			if x2 <= x1 or y2 <= y1:
+				self.get_logger().warn(f"Invalid bbox coords after clipping: {(x1, y1, x2, y2)}")
+				res.person = "NONE"
+				res.gender = "NONE"
+				return res
+
+			crop = self.currentImage[y1:y2, x1:x2]
+			person, gender = self.recognize_face(crop)
+			self.get_logger().info(f"Returning current classification: {person} ({gender})")
+			res.person = person
+			res.gender = gender
 		else:
 			self.get_logger().info("Could not send BBox, there is none!")
 			res.person = "NONE"
 			res.gender = "NONE"
 		return res
-
-	def _classification_done_callback(self, future):
-		try:
-			response = future.result()
-			if response is not None:
-				self.last_person = response.person
-				self.last_gender = response.gender
-				self.get_logger().info(f"Received classification: {response.person} ({response.gender})")
-			else:
-				self.get_logger().warn("Empty response from face_classifier")
-		except Exception as e:
-			self.get_logger().error(f"Service call to face_classifier failed: {e}")
 
 
 def main():

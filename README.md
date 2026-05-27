@@ -20,13 +20,13 @@
 
 **Services:**
 - Provides **"/classify_face"** (service type: `FaceRecognition`)
-  - Request: `int32[4] bbox` (bounding box coordinates)
+  - Request: `sensor_msgs/Image image`, `int32[4] bbox` (image/frame where the face was detected + bounding box coordinates)
   - Response: `string person`, `string gender`
   - Matches detected faces against a pre-computed database (`face_db.json`) using normalized embeddings
 
 **Database:**
 - Loads face embeddings from `face_db.json` (installed to package share directory)
-- Crops faces from the current camera frame and compares embeddings to previously recorded faces
+- Crops faces from the detected frame sent by `face_detection.py` and compares embeddings to previously recorded faces
 
 **Important:** InsightFace requires NumPy < 2.0 due to ABI incompatibility with newer NumPy versions. The package is configured to use `numpy<2` (1.26.4) in the Python virtual environment to ensure cv_bridge and other dependent modules work correctly.
 
@@ -74,8 +74,9 @@ ros2 run rins_robot speech_servicer.py
 ros2 run rins_robot ring_detector.py
 ros2 launch rins_robot cylinder_detection_yolo.launch.py device:=0 confidence_threshold:=0.85 max_fps:=8.0
 ros2 run rins_robot visualiser.py
-
 ros2 run rins_robot arm_mover_actions.py
+
+
 -spremembe z ros2 topic pub --once /arm_command std_msgs/msg/String "{data: look_at_belt_right}"
 -izbira med:
     -look_at_belt_right

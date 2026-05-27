@@ -8,7 +8,6 @@ import rclpy
 from rclpy.node import Node
 from rclpy.qos import qos_profile_sensor_data
 from ament_index_python.packages import get_package_share_directory
-from sensor_msgs.msg import Image
 from cv_bridge import CvBridge, CvBridgeError
 import cv2
 import numpy as np
@@ -35,16 +34,11 @@ class FaceClassifier(Node):
         self.face_app = FaceAnalysis(name="buffalo_l", providers=providers)
         self.face_app.prepare(ctx_id=ctx_id)
 
-        # keep last camera frame so we can crop it when a bbox request arrives
+        # keep bridge for decoding request images and optional debug saves
         self.bridge = CvBridge()
-        self.latest_cv_image = None
         self.crop_output_dir = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))), "tmp", "face_crops")
         os.makedirs(self.crop_output_dir, exist_ok=True)
         self.get_logger().info(f"Face crops will be saved to {self.crop_output_dir}")
-        self.image_sub = self.create_subscription(Image,
-                                                 "/oakd/rgb/preview/image_raw",
-                                                 self.image_callback,
-                                                 qos_profile_sensor_data)
 
         self.classificator = self.create_service(FaceRecognition, "/classify_face", self.classify)
         self.get_logger().info("Face classifier service node initialized!")
@@ -134,15 +128,8 @@ class FaceClassifier(Node):
         self.get_logger().info(f"Recognition result: person={best_match['name']}, gender={best_match['gender']}, score={best_score:.4f}")
         return best_match["name"], best_match["gender"]
 
-    def image_callback(self, msg: Image):
-        try:
-            cv_image = self.bridge.imgmsg_to_cv2(msg, "bgr8")
-            self.latest_cv_image = cv_image
-        except CvBridgeError as e:
-            self.get_logger().error(f"CvBridge error converting image: {e}")
-
     def classify(self, req, res):
-        # tolerant access to bbox field
+        # tolerant access to bbox field and request image
         bbox = req.bbox
         if bbox is None:
             self.get_logger().warn("Received classify request without bbox")
@@ -150,31 +137,19 @@ class FaceClassifier(Node):
             res.gender = "NONE"
             return res
 
-        if self.latest_cv_image is None:
-            self.get_logger().warn("No recent image available to crop")
+        if getattr(req, "image", None) is None:
+            self.get_logger().warn("Received classify request without image")
             res.person = "NONE"
             res.gender = "NONE"
             return res
 
-        # Work on a snapshot so the subscription callback cannot modify the image mid-request.
-        frame = self.latest_cv_image.copy()
-
-        """# attempt to coerce bbox to sequence of four numbers
-        coords = None
         try:
-            coords = list(bbox)
-        except Exception:
-            # if bbox is not iterable, try attributes commonly used
-            try:
-                coords = [bbox.xmin, bbox.ymin, bbox.xmax, bbox.ymax]
-            except Exception:
-                coords = None
-
-        if coords is None or len(coords) < 4:
-            self.get_logger().warn("BBox in request is not a 4-value sequence")
+            frame = self.bridge.imgmsg_to_cv2(req.image, "bgr8")
+        except CvBridgeError as e:
+            self.get_logger().error(f"CvBridge error converting request image: {e}")
             res.person = "NONE"
             res.gender = "NONE"
-            return res"""
+            return res
 
         x1, y1, x2, y2 = [int(float(v)) for v in bbox]
         h, w = frame.shape[:2]

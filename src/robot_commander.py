@@ -75,6 +75,14 @@ ANOMALY_RED_YAW = 3.14      # dol
 ANOMALY_GREEN_YAW = 1.57    # levo
 ANOMALY_ARM_INSPECT_COMMAND = "look_at_belt_left"
 ANOMALY_ARM_DEFAULT_COMMAND = "up"
+FACE_SEARCH_TURN_RADIANS = 0.35
+FACE_SEARCH_MAX_ATTEMPTS = 3
+
+# Nav2 naj gre samo do varne pred-tocke, potem se robot premika direktno s /cmd_vel.
+# To je pomembno pri red/green anomaly celicah, ker sta pravi tocki zelo blizu stene/costmap roba.
+ANOMALY_PRE_START_OFFSET = 0.35
+ANOMALY_NAV_CLOSE_ENOUGH_DISTANCE = 0.70
+ANOMALY_DIRECT_POINT_TOLERANCE = 0.15
 
 class RobotCommander(Node):
 
@@ -108,6 +116,7 @@ class RobotCommander(Node):
         self.faces = []
         self.cylinders = []
         self.rings = []
+        self.last_face_coords_time = None
         #-----------------------------------------------------------------------------------------
         
         # ROS2 publishers
@@ -365,6 +374,27 @@ class RobotCommander(Node):
         self.warn("Direct turn timed out.")
         return False
 
+    def turnDirectToPoint(self, target_x, target_y, yaw_tolerance=0.06, timeout=10.0):
+        """Obrni robota proti znani map koordinati iz trenutne AMCL poze.
+
+        To se uporabi po Nav2 prihodu do obraza/ringa, ker se mora yaw izracunati
+        sele iz dejanske koncne pozicije robota, ne iz pozicije pred zacetkom navigacije.
+        """
+        if not hasattr(self, 'current_pose'):
+            self.warn("Cannot turn to point because current pose is not available.")
+            return False
+
+        robot_position = self.get_robot_position()
+        dx = target_x - robot_position[0]
+        dy = target_y - robot_position[1]
+
+        if math.hypot(dx, dy) < 1e-3:
+            self.warn("Cannot turn to point because target is at robot position.")
+            return False
+
+        target_yaw = math.atan2(dy, dx)
+        return self.turnDirectToYaw(target_yaw, yaw_tolerance=yaw_tolerance, timeout=timeout)
+
     def driveStraightToXY(self, target_x, target_y, distance_tolerance=0.08,
                           max_linear=0.16, max_angular=0.6, timeout=30.0):
         if not hasattr(self, 'current_pose'):
@@ -432,6 +462,37 @@ class RobotCommander(Node):
 
         return self.getResult() == TaskResult.SUCCEEDED
 
+    def goToXYYawCloseEnough(self, x, y, yaw, close_enough_distance=0.70):
+        """Nav2 cilj z mehkim uspesnim pogojem.
+
+        Pri anomaly celicah so cilji ob steni/costmap robu, zato Nav2 vcasih aborta,
+        ceprav je robot prakticno dovolj blizu pred-tocki. V tem primeru nadaljujemo
+        z direktnim /cmd_vel manevrom.
+        """
+        success = self.goToXYYaw(x, y, yaw)
+        if success:
+            return True
+
+        if not hasattr(self, 'current_pose'):
+            return False
+
+        robot_position = self.get_robot_position()
+        distance = math.hypot(x - robot_position[0], y - robot_position[1])
+
+        if distance <= close_enough_distance:
+            self.warn(
+                f"Nav2 failed near ({x:.2f}, {y:.2f}), but robot is close enough "
+                f"({distance:.2f} m). Continuing with direct movement."
+            )
+            self.turnDirectToYaw(yaw, timeout=6.0)
+            return True
+
+        self.warn(
+            f"Nav2 failed and robot is still too far from ({x:.2f}, {y:.2f}): "
+            f"{distance:.2f} m."
+        )
+        return False
+
     def _anomaly_point_to_xy(self, point):
         if len(point) == 2:
             return point[0], point[1]
@@ -440,6 +501,16 @@ class RobotCommander(Node):
         raise ValueError("Anomaly coordinate must be (x, y) or (id, x, y).")
 
     def runAnomalyMovement(self, coordinates, yaw, label="anomaly"):
+        """Premik po rdeci/zeleni anomaly celici.
+
+        Minimalna logika:
+        1. Nav2 gre samo do varne pred-tocke pred prvo koordinato.
+        2. Robot se direktno poravna proti drugi koordinati.
+        3. Z /cmd_vel gre do prve tocke.
+        4. Roka/kamera gre levo.
+        5. Robot gre direktno naravnost do druge tocke brez Nav2 plannerja.
+        6. Roka/kamera se vrne v default.
+        """
         if len(coordinates) < 2:
             self.warn(f"Need at least two coordinates for {label} movement.")
             return False
@@ -447,22 +518,76 @@ class RobotCommander(Node):
         first_x, first_y = self._anomaly_point_to_xy(coordinates[0])
         second_x, second_y = self._anomaly_point_to_xy(coordinates[1])
 
-        self.info(f"Starting {label} movement.")
-        if not self.goDirectToXYYaw(first_x, first_y, yaw):
-            self.warn(f"Could not reach first {label} coordinate.")
+        # Uporabi dejansko smer med tockama. Parameter yaw pustimo kot fallback,
+        # ampak za rdeco/zeleno celico je bolj robustno racunati smer iz koordinat.
+        dx = second_x - first_x
+        dy = second_y - first_y
+        if math.hypot(dx, dy) > 1e-3:
+            line_yaw = math.atan2(dy, dx)
+        else:
+            line_yaw = yaw
+
+        pre_start_x = first_x - ANOMALY_PRE_START_OFFSET * math.cos(line_yaw)
+        pre_start_y = first_y - ANOMALY_PRE_START_OFFSET * math.sin(line_yaw)
+
+        self.info(
+            f"Starting {label} movement. "
+            f"pre_start=({pre_start_x:.2f}, {pre_start_y:.2f}), "
+            f"first=({first_x:.2f}, {first_y:.2f}), "
+            f"second=({second_x:.2f}, {second_y:.2f}), yaw={line_yaw:.2f}"
+        )
+
+        # Do pred-tocke naj pelje Nav2, ker je to se varna tocka stran od roba/stene.
+        if not self.goToXYYawCloseEnough(
+            pre_start_x,
+            pre_start_y,
+            line_yaw,
+            close_enough_distance=ANOMALY_NAV_CLOSE_ENOUGH_DISTANCE,
+        ):
+            self.warn(f"Could not get close enough to {label} pre-start coordinate.")
+            return False
+
+        # Od tu naprej ne uporabljamo Nav2, ker pravi tocki lezita ob robu/costmap steni.
+        if not self.turnDirectToYaw(line_yaw, timeout=6.0):
+            self.warn(f"Could not align with {label} line.")
+            return False
+
+        if not self.driveStraightToXY(
+            first_x,
+            first_y,
+            distance_tolerance=ANOMALY_DIRECT_POINT_TOLERANCE,
+            timeout=12.0,
+        ):
+            self.warn(f"Could not reach first {label} coordinate with direct drive.")
+            return False
+
+        if not self.turnDirectToYaw(line_yaw, timeout=5.0):
+            self.warn(f"Could not align at first {label} coordinate.")
             return False
 
         self.setArmPosition(ANOMALY_ARM_INSPECT_COMMAND)
 
-        success = self.goDirectToXYYaw(second_x, second_y, yaw)
-        self.setArmPosition(ANOMALY_ARM_DEFAULT_COMMAND)
+        try:
+            line_length = math.hypot(second_x - first_x, second_y - first_y)
+            direct_timeout = max(18.0, line_length / 0.10 + 8.0)
 
-        if not success:
-            self.warn(f"Could not reach second {label} coordinate.")
-            return False
+            success = self.driveStraightToXY(
+                second_x,
+                second_y,
+                distance_tolerance=ANOMALY_DIRECT_POINT_TOLERANCE,
+                timeout=direct_timeout,
+            )
 
-        self.info(f"Finished {label} movement.")
-        return True
+            if not success:
+                self.warn(f"Could not reach second {label} coordinate.")
+                return False
+
+            self.turnDirectToYaw(line_yaw, timeout=4.0)
+            self.info(f"Finished {label} movement.")
+            return True
+
+        finally:
+            self.setArmPosition(ANOMALY_ARM_DEFAULT_COMMAND)
 
     def runRedAnomalyMovement(self):
         return self.runAnomalyMovement(ANOMALY_RED_COORDINATES, ANOMALY_RED_YAW, "red anomaly")
@@ -489,6 +614,23 @@ class RobotCommander(Node):
     #---------------------------------------------------------------------------
     def updateFaceCoords(self,data):
         self.faces = list(zip(data.points, data.ids))
+        self.last_face_coords_time = self.get_clock().now()
+
+    def hasFreshFaceDetection(self, max_age_seconds=0.75):
+        if not self.faces or self.last_face_coords_time is None:
+            return False
+
+        age_seconds = (self.get_clock().now() - self.last_face_coords_time).nanoseconds / 1e9
+        return age_seconds <= max_age_seconds
+
+    def searchForFace(self, turn_radians=FACE_SEARCH_TURN_RADIANS):
+        if not hasattr(self, 'current_pose'):
+            self.warn("Cannot search for face because current pose is not available.")
+            return False
+
+        target_yaw = self._wrap_angle(self.get_robot_yaw() + turn_radians)
+        self.info(f"Searching for face by turning {turn_radians:.2f} rad.")
+        return self.turnDirectToYaw(target_yaw, timeout=4.0)
 
     def updateCylinderCoords(self,data):
         self.cylinders = list(zip(
@@ -672,8 +814,32 @@ class RobotCommander(Node):
         self.info(f"Going to collect tasks from {len(facesCopy)} faces.")
         for point,id in facesCopy:
             self.info(f"Going towards face {id}.")
-            if not self._go_close_enough(point.x, point.y, standoff_distance=0.1, close_enough_distance=0.25):
+            if not self._go_close_enough(point.x, point.y, standoff_distance=0.25, close_enough_distance=0.35):
                 continue
+
+            detected = False
+            for attempt in range(FACE_SEARCH_MAX_ATTEMPTS):
+                self.spinSome(0.2)
+                if self.hasFreshFaceDetection():
+                    detected = True
+                    break
+
+                self.warn(
+                    f"No fresh face detection for face {id}; turning a bit and retrying ({attempt + 1}/{FACE_SEARCH_MAX_ATTEMPTS})."
+                )
+                if not self.searchForFace():
+                    break
+
+            if not detected:
+                self.warn(f"Skipping face {id} because no face was visible after the search turns.")
+                continue
+
+            # Pomembno: po koncu Nav2 navigacije ponovno izracunaj yaw iz trenutne
+            # AMCL poze in se obrni proti dejanski koordinati obraza.
+            # Prej se je robot vcasih obrnil narobe, ker je bil yaw izracunan
+            # pred premikom oziroma za standoff cilj, ne za koncno pozicijo.
+            self.turnDirectToPoint(point.x, point.y, timeout=8.0)
+            self.spinSome(0.3)
 
             person, gender = self.recognizeFaceTwice()
             assignment = self.requestTaskFromPerson(person, gender)
@@ -692,17 +858,18 @@ class RobotCommander(Node):
 
     def executeBarrelTask(self):
         self.spinSome(1.0)
-        lyingCylindersCopy = [
+        leakingCylinders = [
             cylinder for cylinder in self.cylinders.copy()
-            if str(cylinder[3]).lower() == "lying"
+            if bool(cylinder[4])
         ]
-        self.info(f"Barrel task: visiting {len(lyingCylindersCopy)} lying cylinders.")
+        self.info(f"Barrel task: visiting {len(leakingCylinders)} leaking cylinders.")
 
-        for point,id,color,orientation,leaking in lyingCylindersCopy:
+        for point,id,color,orientation,leaking in leakingCylinders:
             self.info(f"Going towards lying cylinder {id}.")
             if not self._go_close_enough(point.x, point.y, standoff_distance=0.25, close_enough_distance=0.5):
                 continue
 
+            # Only leaking cylinders are included, but keep the check defensive
             if leaking:
                 if self.say("Alert! Alert! This barrel is leaking!"):
                     self.info("Successfully warned about a spill!")

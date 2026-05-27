@@ -53,6 +53,7 @@ install(PROGRAMS
   src/face_dialogue_servicer.py
   src/face_classifier.py
   src/ring_detector.py
+  src/arm_mover_actions.py
   src/cylinder_detection.py
   src/capture_cylinder_dataset.py
   src/visualiser.py
