@@ -16,7 +16,7 @@ Parameters (ROS2):
     camera_topic       (default: /top_camera/rgb/preview/image_raw)
     model_path         (default: <package_share>/models/anomaly_model.pt)
     show_debug         (default: True)
-    auto_scan          (default: True)
+    auto_scan          (default: False)
     stable_frames      (default: 8)    frames a tile must be stable before
                                        auto-inspection fires
     stable_iou         (default: 0.85) IoU threshold for "same tile"
@@ -39,6 +39,7 @@ from rclpy.qos import qos_profile_sensor_data
 from sensor_msgs.msg import Image
 
 from rins_robot.srv import InspectTile, ReportAnomalyTile
+from std_srvs.srv import SetBool
 
 
 class AnomalyDetectorNode(Node):
@@ -49,7 +50,7 @@ class AnomalyDetectorNode(Node):
             ('camera_topic', '/top_camera/rgb/preview/image_raw'),
             ('model_path', ''),
             ('show_debug', True),
-            ('auto_scan', True),
+            ('auto_scan', False),
             ('stable_frames', 8),
             ('stable_iou', 0.85),
             ('reacquire_misses', 6),
@@ -113,6 +114,8 @@ class AnomalyDetectorNode(Node):
                                  qos_profile_sensor_data)
         self.create_service(InspectTile, '/inspect_tile',
                             self._inspect_tile_cb)
+        # service to enable/disable auto_scan remotely
+        self.create_service(SetBool, '/set_auto_scan', self._set_auto_scan_cb)
         self._report_client = self.create_client(ReportAnomalyTile,
                                                  '/report_anomaly_tile')
 
@@ -648,6 +651,18 @@ class AnomalyDetectorNode(Node):
             response.anomaly_detected = False
             response.defect_score     = 0.0
 
+        return response
+
+    def _set_auto_scan_cb(self, request: SetBool.Request, response: SetBool.Response) -> SetBool.Response:
+        try:
+            self.auto_scan = bool(request.data)
+            response.success = True
+            response.message = f"auto_scan set to {self.auto_scan}"
+            self.get_logger().info(response.message)
+        except Exception as e:
+            response.success = False
+            response.message = f"failed to set auto_scan: {e}"
+            self.get_logger().error(response.message)
         return response
 
     # ── shared inference path ──────────────────────────────────────────────────
