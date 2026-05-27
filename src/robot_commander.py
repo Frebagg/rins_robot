@@ -45,6 +45,7 @@ from rins_robot.srv import BoundingBox
 from rins_robot.srv import FaceDialogue
 from rins_robot.srv import ReportTaskAssignment
 from rins_robot.srv import Speech
+from std_srvs.srv import SetBool
 import numpy as np
 
 class TaskResult(Enum):
@@ -62,8 +63,8 @@ amcl_pose_qos = QoSProfile(
 # Koordinate za anomaly premik.
 # Vpisi kot (x, y). Ce zelis zraven oznako, lahko vpises tudi (id, x, y).
 ANOMALY_RED_COORDINATES = [
-    (1, 0.55, 4.75),
-    (2, -1.75, 4.75)
+    (1, 0.55, -4.72),
+    (2, -1.75, -4.72)
 ]
 
 ANOMALY_GREEN_COORDINATES = [
@@ -74,7 +75,7 @@ ANOMALY_GREEN_COORDINATES = [
 ANOMALY_RED_YAW = 3.14      # dol
 ANOMALY_GREEN_YAW = 1.57    # levo
 ANOMALY_ARM_INSPECT_COMMAND = "look_at_belt_left"
-ANOMALY_ARM_DEFAULT_COMMAND = "up"
+ANOMALY_ARM_DEFAULT_COMMAND = "garage"
 FACE_SEARCH_TURN_RADIANS = 0.35
 FACE_SEARCH_MAX_ATTEMPTS = 3
 
@@ -112,6 +113,7 @@ class RobotCommander(Node):
         self.boundingBoxClient = self.create_client(BoundingBox,"/bounding_box_service")
         self.faceDialogueClient = self.create_client(FaceDialogue,"/face_dialogue_service")
         self.reportTaskClient = self.create_client(ReportTaskAssignment,"/report_task_assignment")
+        self.anomalyClient = self.create_client(SetBool, '/set_auto_scan')
 
         self.faces = []
         self.cylinders = []
@@ -565,6 +567,23 @@ class RobotCommander(Node):
             self.warn(f"Could not align at first {label} coordinate.")
             return False
 
+        # Enable anomaly detector auto-scan before moving the arm. Retry briefly
+        enabled = False
+        try:
+            for _ in range(5):
+                if self.anomalyClient.wait_for_service(timeout_sec=1.0):
+                    req = SetBool.Request()
+                    req.data = True
+                    fut = self.anomalyClient.call_async(req)
+                    rclpy.spin_until_future_complete(self, fut)
+                    enabled = True
+                    break
+                time.sleep(0.25)
+            if not enabled:
+                self.warn("/set_auto_scan service not available; continuing without enabling anomaly detector.")
+        except Exception:
+            self.warn("Failed to enable anomaly detector; continuing anyway.")
+
         self.setArmPosition(ANOMALY_ARM_INSPECT_COMMAND)
 
         try:
@@ -588,6 +607,22 @@ class RobotCommander(Node):
 
         finally:
             self.setArmPosition(ANOMALY_ARM_DEFAULT_COMMAND)
+            # Disable anomaly detector auto-scan after finishing. Retry briefly
+            disabled = False
+            try:
+                for _ in range(5):
+                    if self.anomalyClient.wait_for_service(timeout_sec=1.0):
+                        req = SetBool.Request()
+                        req.data = False
+                        fut = self.anomalyClient.call_async(req)
+                        rclpy.spin_until_future_complete(self, fut)
+                        disabled = True
+                        break
+                    time.sleep(0.25)
+                if not disabled:
+                    self.warn("/set_auto_scan service not available; could not disable anomaly detector.")
+            except Exception:
+                self.warn("Failed to disable anomaly detector; continuing.")
 
     def runRedAnomalyMovement(self):
         return self.runAnomalyMovement(ANOMALY_RED_COORDINATES, ANOMALY_RED_YAW, "red anomaly")
