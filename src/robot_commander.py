@@ -899,6 +899,7 @@ class RobotCommander(Node):
             if bool(cylinder[4])
         ]
         self.info(f"Barrel task: visiting {len(leakingCylinders)} leaking cylinders.")
+        self.say("I am going to the leaked barrels.")
 
         for point,id,color,orientation,leaking in leakingCylinders:
             self.info(f"Going towards lying cylinder {id}.")
@@ -917,8 +918,10 @@ class RobotCommander(Node):
     def executeAnomalyTask(self, cell):
         cell = (cell or "").lower()
         if cell == "red":
+            self.say("I am going to detect anomalies.")
             return self.runRedAnomalyMovement()
         if cell == "green":
+            self.say("I am going to detect anomalies.")
             return self.runGreenAnomalyMovement()
 
         self.warn(f"Unknown anomaly cell: {cell}")
@@ -967,6 +970,8 @@ def main(args=None):
     # If it is docked, undock it first
     if rc.is_docked:
         rc.undock()
+
+    rc.say("I am going to explore the space now.")
     
     # "yaw" == 0 : gor
     # "yaw" == 1 : desno
@@ -979,7 +984,7 @@ def main(args=None):
     # "yaw" == 8 : obrat na mestu
     # "yaw" == 9 : direktno naravnost do tocke brez Nav2 plannerja
     
-    """koordinate = [
+    koordinate = [
         (1, 0.2, -0.5, 8),
         (2, 0.85, -2.0, 8),
         (3, 0.0, -3.7, 3),
@@ -1047,10 +1052,11 @@ def main(args=None):
             while not rc.isTaskComplete():
                 time.sleep(1)
     
-    time.sleep(2)"""
+    time.sleep(2)
     #-----------------------------------------------------------------
     #DRUGI KROG - POGOVORI IN IZVAJANJE TASKOV
     rc.info("Going to collect face tasks and execute them")
+    rc.say("I am going to visit everyone.")
     rc.visitDetections()
 
     # Za rocni test anomaly premika odkomentiraj eno vrstico:
@@ -1081,6 +1087,8 @@ def main(args=None):
 
     rc.info("Moving arm to line-following pose...")
     rc.setArmPosition("lines")
+
+    rc.say("I am going to the line start point now.")
 
     rc.info("Starting line_follower for line navigation...")
     line_follower_process = subprocess.Popen([
