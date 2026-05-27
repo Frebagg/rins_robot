@@ -90,6 +90,8 @@ class detect_faces(Node):
 		self.currentBBox = None
 		self.currentImage = None
 		self.currentFaceId = None
+		self.lastRecognizedPerson = "NONE"
+		self.lastRecognizedGender = "NONE"
 		self.identity_pub = self.create_publisher(String, '/face_identity', 10)
 		#---------------------------------------------------------------------------------
 
@@ -151,6 +153,23 @@ class detect_faces(Node):
 			if bestBbox != None:
 				cvImage = cv2.rectangle(cvImage, (int(bestBbox[0]), int(bestBbox[1])), (int(bestBbox[2]), int(bestBbox[3])), self.detection_color, 3)
 				cvImage = cv2.circle(cvImage, bestCenter, 5, self.detection_color, -1)
+				
+				# Run face recognition on every frame
+				try:
+					x1, y1, x2, y2 = [int(float(v)) for v in bestBbox]
+					h, w = self.currentImage.shape[:2]
+					x1 = max(0, min(w - 1, x1))
+					x2 = max(0, min(w, x2))
+					y1 = max(0, min(h - 1, y1))
+					y2 = max(0, min(h, y2))
+					
+					if x2 > x1 and y2 > y1:
+						crop = self.currentImage[y1:y2, x1:x2]
+						person, gender = self.recognize_face(crop)
+						self.lastRecognizedPerson = person
+						self.lastRecognizedGender = gender
+				except Exception as e:
+					self.get_logger().debug(f"Error recognizing face in callback: {e}")
 
 			cv2.imshow("image",cvImage)
 
@@ -428,42 +447,21 @@ class detect_faces(Node):
 		return best_match["name"], best_match["gender"]
 
 	def sendBoundingBox(self, req, res):
-		if self.currentBBox is not None and self.currentImage is not None:
-			try:
-				x1, y1, x2, y2 = [int(float(v)) for v in self.currentBBox]
-			except Exception:
-				x1, y1, x2, y2 = list(self.currentBBox)
-
-			h, w = self.currentImage.shape[:2]
-			x1 = max(0, min(w - 1, x1))
-			x2 = max(0, min(w, x2))
-			y1 = max(0, min(h - 1, y1))
-			y2 = max(0, min(h, y2))
-
-			if x2 <= x1 or y2 <= y1:
-				self.get_logger().warn(f"Invalid bbox coords after clipping: {(x1, y1, x2, y2)}")
-				res.person = "NONE"
-				res.gender = "NONE"
-				return res
-
-			crop = self.currentImage[y1:y2, x1:x2]
-			person, gender = self.recognize_face(crop)
-			self.get_logger().info(f"Returning current classification: {person} ({gender})")
-			res.person = person
-			res.gender = gender
-			# publish identity update so visualiser can update labels in RViz
-			try:
-				fid = getattr(self, 'currentFaceId', None)
-				if fid is not None:
-					msg = String()
-					msg.data = f"{fid}:{person}"
-					self.identity_pub.publish(msg)
-			except Exception as e:
-				self.get_logger().warn(f"Could not publish identity: {e}")
-		else:
-			self.get_logger().info("Could not send BBox, there is none!")
-			res.person = "NONE"
-			res.gender = "NONE"
+		# Return the last recognized face from continuous frame processing
+		self.get_logger().info(f"Returning last recognized face: {self.lastRecognizedPerson} ({self.lastRecognizedGender})")
+		res.person = self.lastRecognizedPerson
+		res.gender = self.lastRecognizedGender
+		
+		# Publish identity update so visualiser can update labels in RViz
+		try:
+			fid = getattr(self, 'currentFaceId', None)
+			if fid is not None:
+				msg = String()
+				msg.data = f"{fid}:{self.lastRecognizedPerson}"
+				self.identity_pub.publish(msg)
+		except Exception as e:
+			self.get_logger().warn(f"Could not publish identity: {e}")
+		
 		return res
 
 
