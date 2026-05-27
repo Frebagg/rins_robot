@@ -26,6 +26,7 @@ from geometry_msgs.msg import Point
 import time
 
 from rins_robot.srv import BoundingBox
+from std_msgs.msg import String
 
 
 from ultralytics import YOLO
@@ -88,6 +89,8 @@ class detect_faces(Node):
 		self.pendingBBox = None
 		self.currentBBox = None
 		self.currentImage = None
+		self.currentFaceId = None
+		self.identity_pub = self.create_publisher(String, '/face_identity', 10)
 		#---------------------------------------------------------------------------------
 
 		#---------------------------------------------------------------------------------
@@ -229,6 +232,7 @@ class detect_faces(Node):
 		self.coords[bestIdx] = (faceId, face, count + 1, now)
 
 		self.currentBBox = self.pendingBBox #za posiljanje naprej
+		self.currentFaceId = faceId
 
 		return True
 
@@ -254,6 +258,7 @@ class detect_faces(Node):
 			if count >= self.MINHITS:
 				self.coords.append((self.nextFaceId, face, count, now))
 				self.currentBBox = self.pendingBBox
+				self.currentFaceId = self.nextFaceId
 				self.nextFaceId += 1
 				del self.pendingCoords[bestIdx]
 			return
@@ -446,6 +451,15 @@ class detect_faces(Node):
 			self.get_logger().info(f"Returning current classification: {person} ({gender})")
 			res.person = person
 			res.gender = gender
+			# publish identity update so visualiser can update labels in RViz
+			try:
+				fid = getattr(self, 'currentFaceId', None)
+				if fid is not None:
+					msg = String()
+					msg.data = f"{fid}:{person}"
+					self.identity_pub.publish(msg)
+			except Exception as e:
+				self.get_logger().warn(f"Could not publish identity: {e}")
 		else:
 			self.get_logger().info("Could not send BBox, there is none!")
 			res.person = "NONE"

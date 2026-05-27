@@ -6,6 +6,7 @@ from rclpy.qos import QoSDurabilityPolicy, QoSHistoryPolicy, QoSProfile, QoSReli
 
 from visualization_msgs.msg import Marker
 from rins_robot.msg import FaceCoords, RingCoords, CylinderCoords
+from std_msgs.msg import String
 
 
 class visualizeMarkers(Node):
@@ -33,6 +34,12 @@ class visualizeMarkers(Node):
 
         self.faceMarkerIds = []
         self.ringMarkerIds = []
+
+        # store latest known positions for faces so labels can be updated
+        self.face_positions = {}
+
+        # subscribe to identity updates (face_id:name)
+        self.identitySub = self.create_subscription(String, '/face_identity', self.manageIdentity_callback, 10)
 
         self.ringOffset = 100
         self.cylinderOffset = 300
@@ -80,7 +87,47 @@ class visualizeMarkers(Node):
             self.faceMarkerPublisher.publish(marker)
             self.faceMarkerPublisher.publish(text)
             self.faceMarkerIds.append(face_id)
+            # remember position so label updates can reuse pose
+            try:
+                self.face_positions[int(face_id)] = face
+            except Exception:
+                pass
             self.get_logger().info(f'Published face {face_id}!')
+
+    def manageIdentity_callback(self, msg):
+        try:
+            parts = str(msg.data).split(':', 1)
+            face_id = int(parts[0])
+            name = parts[1] if len(parts) > 1 else ''
+        except Exception:
+            self.get_logger().warn(f'Invalid identity message: {msg.data}')
+            return
+
+        # If we know the face position, reuse it; otherwise don't change pose
+        face_pos = self.face_positions.get(face_id, None)
+
+        text = Marker()
+        text.header.frame_id = 'map'
+        text.header.stamp = self.get_clock().now().to_msg()
+        text.ns = 'faces_label'
+        text.id = int(face_id)
+        text.type = Marker.TEXT_VIEW_FACING
+        if face_pos is not None:
+            text.pose.position.x = face_pos.x
+            text.pose.position.y = face_pos.y
+            text.pose.position.z = face_pos.z + 0.8
+        else:
+            text.pose.position.x = 0.0
+            text.pose.position.y = 0.0
+            text.pose.position.z = 0.0
+        text.pose.orientation.w = 1.0
+        text.scale.z = 0.5
+        text.color.r = text.color.g = text.color.b = text.color.a = 1.0
+        text.text = f'{name}'
+        text.action = Marker.ADD
+
+        self.faceMarkerPublisher.publish(text)
+        self.get_logger().info(f'Updated face label {face_id} -> {name}')
 
     def manageRingMarkers_callback(self, msg):
         if len(msg.points) != len(msg.ids) or len(msg.points) != len(msg.colors):
