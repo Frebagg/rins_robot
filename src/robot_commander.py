@@ -85,6 +85,9 @@ FACE_SEARCH_MAX_ATTEMPTS = 3
 ANOMALY_PRE_START_OFFSET = 0.35
 ANOMALY_NAV_CLOSE_ENOUGH_DISTANCE = 0.70
 ANOMALY_DIRECT_POINT_TOLERANCE = 0.15
+ANOMALY_ARM_SETTLE_SECONDS = 1.0
+ANOMALY_EXIT_TURN_RADIANS = -math.pi / 2.0
+ANOMALY_EXIT_FORWARD_DISTANCE = 0.40
 
 class RobotCommander(Node):
 
@@ -437,6 +440,22 @@ class RobotCommander(Node):
             return False
         return self.turnDirectToYaw(yaw)
 
+    def driveForwardRelative(self, distance, distance_tolerance=0.08, timeout=10.0):
+        if not hasattr(self, 'current_pose'):
+            self.warn("Cannot drive forward because current pose is not available.")
+            return False
+
+        yaw = self.get_robot_yaw()
+        robot_position = self.get_robot_position()
+        target_x = robot_position[0] + distance * math.cos(yaw)
+        target_y = robot_position[1] + distance * math.sin(yaw)
+        return self.driveStraightToXY(
+            target_x,
+            target_y,
+            distance_tolerance=distance_tolerance,
+            timeout=timeout,
+        )
+
     def setArmPosition(self, command, wait_seconds=3.5):
         msg = String()
         msg.data = command
@@ -568,7 +587,9 @@ class RobotCommander(Node):
             self.warn(f"Could not align at first {label} coordinate.")
             return False
 
-        # Enable anomaly detector auto-scan before moving the arm. Retry briefly
+        self.setArmPosition(ANOMALY_ARM_INSPECT_COMMAND)
+
+        # Enable anomaly detector auto-scan after the arm/camera is in inspect pose.
         enabled = False
         try:
             for _ in range(5):
@@ -585,7 +606,7 @@ class RobotCommander(Node):
         except Exception:
             self.warn("Failed to enable anomaly detector; continuing anyway.")
 
-        self.setArmPosition(ANOMALY_ARM_INSPECT_COMMAND)
+        time.sleep(ANOMALY_ARM_SETTLE_SECONDS)
 
         try:
             line_length = math.hypot(second_x - first_x, second_y - first_y)
@@ -624,6 +645,18 @@ class RobotCommander(Node):
                     self.warn("/set_auto_scan service not available; could not disable anomaly detector.")
             except Exception:
                 self.warn("Failed to disable anomaly detector; continuing.")
+
+            self.info("Leaving anomaly zone with a direct right-turn escape maneuver.")
+            if hasattr(self, 'current_pose'):
+                exit_yaw = self._wrap_angle(self.get_robot_yaw() + ANOMALY_EXIT_TURN_RADIANS)
+                self.turnDirectToYaw(exit_yaw, timeout=6.0)
+                self.driveForwardRelative(
+                    ANOMALY_EXIT_FORWARD_DISTANCE,
+                    distance_tolerance=ANOMALY_DIRECT_POINT_TOLERANCE,
+                    timeout=8.0,
+                )
+            else:
+                self.warn("Skipping anomaly exit maneuver because current pose is not available.")
 
     def runRedAnomalyMovement(self):
         return self.runAnomalyMovement(ANOMALY_RED_COORDINATES, ANOMALY_RED_YAW, "red anomaly")
