@@ -122,9 +122,6 @@ class RobotCommander(Node):
         self.last_face_coords_time = None
         #-----------------------------------------------------------------------------------------
         
-        # Child process tracking for graceful shutdown
-        self.line_follower_process = None
-        
         # ROS2 publishers
         self.initial_pose_pub = self.create_publisher(PoseWithCovarianceStamped, 'initialpose', 10)
         self.arm_command_pub = self.create_publisher(String, '/arm_command', 10)
@@ -139,24 +136,8 @@ class RobotCommander(Node):
         self.get_logger().info(f"NEW Robot commander has been initialized!")
         
     def destroyNode(self):
-        self._cleanup_child_processes()
         self.nav_to_pose_client.destroy()
-        super().destroy_node()
-    
-    def _cleanup_child_processes(self):
-        """Gracefully terminate any child processes (e.g., line_follower)."""
-        if self.line_follower_process is not None:
-            if self.line_follower_process.poll() is None:  # Still running
-                self.info(f"Terminating line_follower (PID {self.line_follower_process.pid})...")
-                try:
-                    self.line_follower_process.terminate()
-                    self.line_follower_process.wait(timeout=2.0)
-                    self.info("line_follower terminated gracefully.")
-                except subprocess.TimeoutExpired:
-                    self.warn("line_follower did not terminate in time, killing forcefully...")
-                    self.line_follower_process.kill()
-                    self.line_follower_process.wait()
-            self.line_follower_process = None     
+        super().destroy_node()     
 
     def goToPose(self, pose, behavior_tree=''):
         """Send a `NavToPose` action request."""
@@ -1102,10 +1083,10 @@ def main(args=None):
     rc.setArmPosition("lines")
 
     rc.info("Starting line_follower for line navigation...")
-    rc.line_follower_process = subprocess.Popen([
+    line_follower_process = subprocess.Popen([
         "ros2", "run", "rins_robot", "line_follower.py"
     ])
-    rc.info(f"line_follower started with PID {rc.line_follower_process.pid}")
+    rc.info(f"line_follower started with PID {line_follower_process.pid}")
     
     rc.info("Finishing, give good grade!")
     #-------------------------------------------------------------------
