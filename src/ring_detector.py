@@ -1,5 +1,3 @@
-#!/usr/bin/env python3
-
 """Ring detector node. See README.md for design, topics, and tuning."""
 
 import rclpy
@@ -352,70 +350,76 @@ class RingDetector(Node):
         self, bgr: np.ndarray, depth_m: np.ndarray
     ) -> np.ndarray:
         h, w = bgr.shape[:2]
+        out = np.zeros((h, w), dtype=np.uint8)
 
-        kernel_sizes = sorted(set(K for _, _, K in NEIGHBOURHOOD_DEPTH_BUCKETS))
-        results: dict[int, np.ndarray] = {}
-        for K in kernel_sizes:
+        bucket_masks = {}
+        needed_K = set()
+        for lo, hi, K in NEIGHBOURHOOD_DEPTH_BUCKETS:
+            m = (depth_m >= lo) & (depth_m < hi)
+            bucket_masks[(lo, hi, K)] = m
+            if m.any():
+                needed_K.add(K)
+
+        results = {}
+        for K in needed_K:
             results[K] = self._neighbourhood_pass(bgr, depth_m, K)
 
-        out = np.zeros((h, w), dtype=np.uint8)
-        for lo, hi, K in NEIGHBOURHOOD_DEPTH_BUCKETS:
-            bucket = (depth_m >= lo) & (depth_m < hi)
-            out[bucket] = results[K][bucket]
+        for (lo, hi, K), m in bucket_masks.items():
+            if K in results:
+                out[m] = results[K][m]
         return out
 
     @staticmethod
     def _neighbourhood_pass(
         bgr: np.ndarray, depth_m: np.ndarray, K: int
     ) -> np.ndarray:
-        thr_color2 = NEIGHBOURHOOD_DE_THR * NEIGHBOURHOOD_DE_THR
+        thr_color2 = float(NEIGHBOURHOOD_DE_THR * NEIGHBOURHOOD_DE_THR)
 
-        lab = cv2.cvtColor(bgr, cv2.COLOR_BGR2LAB).astype(np.int16)
+        lab = cv2.cvtColor(bgr, cv2.COLOR_BGR2LAB).astype(np.int32)
         h, w = lab.shape[:2]
+        lab_l = lab[..., 0]
+        lab_a = lab[..., 1]
+        lab_b = lab[..., 2]
 
         valid = (depth_m > 0.0) & np.isfinite(depth_m)
+        valid_u8 = valid.astype(np.uint8)
+
+        depth_thr = (NEIGHBOURHOOD_DZ_REL_THR * depth_m).astype(np.float32)
 
         pad = K // 2
-        lab_pad   = cv2.copyMakeBorder(lab, pad, pad, pad, pad,
-                                       cv2.BORDER_REPLICATE)
-        depth_pad = cv2.copyMakeBorder(depth_m, pad, pad, pad, pad,
-                                       cv2.BORDER_REPLICATE)
-        valid_pad = cv2.copyMakeBorder(valid.astype(np.uint8), pad, pad, pad, pad,
+        l_pad = cv2.copyMakeBorder(lab_l, pad, pad, pad, pad, cv2.BORDER_REPLICATE)
+        a_pad = cv2.copyMakeBorder(lab_a, pad, pad, pad, pad, cv2.BORDER_REPLICATE)
+        b_pad = cv2.copyMakeBorder(lab_b, pad, pad, pad, pad, cv2.BORDER_REPLICATE)
+        depth_pad = cv2.copyMakeBorder(depth_m, pad, pad, pad, pad, cv2.BORDER_REPLICATE)
+        valid_pad = cv2.copyMakeBorder(valid_u8, pad, pad, pad, pad,
                                        cv2.BORDER_CONSTANT, value=0)
 
         agree_count = np.zeros((h, w), dtype=np.int32)
-        valid_count = np.zeros((h, w), dtype=np.int32)
+        valid_count = np.rint(
+            cv2.boxFilter(valid_u8.astype(np.float32), -1, (K, K),
+                          normalize=False, borderType=cv2.BORDER_CONSTANT)
+        ).astype(np.int32)
 
         for dy in range(K):
             for dx in range(K):
-                lab_shift   = lab_pad[dy:dy + h, dx:dx + w]
-                depth_shift = depth_pad[dy:dy + h, dx:dx + w]
-                valid_shift = valid_pad[dy:dy + h, dx:dx + w].astype(bool)
+                dl = l_pad[dy:dy + h, dx:dx + w] - lab_l
+                da = a_pad[dy:dy + h, dx:dx + w] - lab_a
+                db = b_pad[dy:dy + h, dx:dx + w] - lab_b
+                d2_color = dl * dl + da * da + db * db
 
-                diff_lab = lab_shift.astype(np.int32) - lab.astype(np.int32)
-                d2_color = (diff_lab[..., 0] ** 2 +
-                            diff_lab[..., 1] ** 2 +
-                            diff_lab[..., 2] ** 2)
-                color_close = d2_color < thr_color2
+                dz = np.abs(depth_pad[dy:dy + h, dx:dx + w] - depth_m)
+                v = valid_pad[dy:dy + h, dx:dx + w]
 
-                dz = np.abs(depth_shift - depth_m)
-                depth_thr = NEIGHBOURHOOD_DZ_REL_THR * depth_m
-                depth_close = dz < depth_thr
-
-                both = valid_shift & color_close & depth_close
+                both = (v != 0) & (d2_color < thr_color2) & (dz < depth_thr)
                 agree_count += both
-                valid_count += valid_shift
 
         min_frac_ok = (
-            (agree_count.astype(np.float32) /
-             np.maximum(valid_count, 1).astype(np.float32))
+            agree_count.astype(np.float32) /
+            np.maximum(valid_count, 1).astype(np.float32)
             >= NEIGHBOURHOOD_MIN_FRAC
         )
         enough_valid = valid_count >= NEIGHBOURHOOD_MIN_VALID
-
-        valid_center = (depth_m > 0.0) & np.isfinite(depth_m)
-
-        keep = min_frac_ok & enough_valid & valid_center
+        keep = min_frac_ok & enough_valid & valid
         return (keep.astype(np.uint8)) * 255
 
     @staticmethod
