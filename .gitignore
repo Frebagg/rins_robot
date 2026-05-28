@@ -1,6 +1,29 @@
-install
-log
-build
+# ROS 2 / colcon build artefacts
+/build/
+/install/
+/log/
+/.colcon/
+compile_commands.json
+
+# ROS runtime output
+rosbag2_*/
+*.bag
+*.bag.active
+*.db3
+*.mcap
+src/frames_*.gv
+src/frames_*.pdf
+!src/frames_2026-05-06_11.36.47.gv
+!src/frames_2026-05-06_11.36.47.pdf
+
+# OS/editor noise
+.DS_Store
+Thumbs.db
+*.swp
+*.swo
+*~
+.idea/
+.vscode/
 
 # Byte-compiled / optimized / DLL files
 __pycache__/
@@ -140,6 +163,8 @@ celerybeat.pid
 
 # Environments
 .env
+.env.*
+!.env.example
 .envrc
 .venv
 env/
@@ -209,3 +234,17 @@ cython_debug/
 marimo/_static/
 marimo/_lsp/
 __marimo__/
+
+# Local ML/data artefacts
+/models/
+/images/
+/datasets/
+/runs/
+*.pt
+!yolov8n.pt
+*.onnx
+*.engine
+*.tflite
+*.pb
+*.npy
+*.npz
