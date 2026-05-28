@@ -8,12 +8,13 @@ endif()
 find_package(ament_cmake REQUIRED)
 find_package(rosidl_default_generators REQUIRED)
 find_package(geometry_msgs REQUIRED)
+find_package(sensor_msgs REQUIRED)
 
 rosidl_generate_interfaces(${PROJECT_NAME}
   "msg/FaceCoords.msg"
   "msg/RingCoords.msg"
   "srv/Speech.srv"
-  DEPENDENCIES geometry_msgs
+  DEPENDENCIES geometry_msgs sensor_msgs
 )
 
 install(DIRECTORY
