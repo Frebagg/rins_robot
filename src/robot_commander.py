@@ -77,6 +77,7 @@ VISIT_FACE_STANDOFF = 0.25                # m; koliko pred obrazom naj se ustavi
 VISIT_RING_STANDOFF = 0.25                # m; koliko pred ringom naj se ustavi
 VISIT_APPROACH_TOL = 0.11                 # m; toleranca pri direktnem obisku objekta
 VISIT_RETURN_TOL = 0.11                   # m; toleranca pri vrnitvi na waypoint
+VISIT_FACE_NO_APPROACH_DISTANCE = 0.25    # m; ce je obraz ze tako blizu waypointa, se robot samo obrne
 
 class RobotCommander(Node):
 
@@ -596,6 +597,33 @@ class RobotCommander(Node):
 
         target_x = float(point.x)
         target_y = float(point.y)
+
+        # Poseben safety check za obraze:
+        # ce je najblizji waypoint ze dovolj blizu obraza, se robot ne poskusa
+        # premakniti se blizje. Samo se obrne proti obrazu, pove tekst in nadaljuje.
+        # To prepreči nepotrebno "mikro voznjo" v steno/oviro, kadar je obraz zelo
+        # blizu ene izmed varnih koordinat.
+        if kind == "face" and distance_from_waypoint <= VISIT_FACE_NO_APPROACH_DISTANCE:
+            robot_position = self.get_robot_position()
+            current_distance_to_target = math.hypot(
+                target_x - robot_position[0],
+                target_y - robot_position[1]
+            )
+            self.info(
+                f"{label} is already close to this waypoint "
+                f"({distance_from_waypoint:.2f} m <= {VISIT_FACE_NO_APPROACH_DISTANCE:.2f} m). "
+                f"Current distance is {current_distance_to_target:.2f} m. "
+                f"Turning only, without approaching closer."
+            )
+
+            self.turnDirectToPoint(target_x, target_y)
+            self.stopRobot()
+            time.sleep(0.15)
+            self.speakPublisher.publish(String(data=speak_text))
+            time.sleep(0.8)
+            self.stopRobot()
+            return True
+
         approach_x, approach_y = self.computeApproachPointFromWaypoint(
             waypoint_x,
             waypoint_y,

@@ -1,3 +1,5 @@
+#!/usr/bin/env python3
+
 """Ring detector node. See README.md for design, topics, and tuning."""
 
 import rclpy
