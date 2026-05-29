@@ -52,13 +52,13 @@ import os
 CONFIDENCE_THRESHOLD   = 0.7
  
 # Depth validity range [metres].  Faces on walls are typically 0.4 – 3.5 m away.
-DEPTH_MIN_M            = 0.30
-DEPTH_MAX_M            = 1.50
+DEPTH_MIN_M            = 0.15
+DEPTH_MAX_M            = 2.50
  
 # Median-depth sampling: half-size of the square patch around bbox centre [pixels]
 DEPTH_PATCH_HALF       = 8    # samples a 17×17 patch
  
-# Pending-stage: how many consistent hits needed before a detection is confirmed
+# Pending-stage: how many consistent hits needed before a detection is confirmed -was 4
 MINHITS                = 4
  
 # Matching radius for associating a new detection with an existing pending entry [m]
@@ -76,7 +76,7 @@ MATCH_Z_THRESHOLD      = 0.60
 MERGE_XY_THRESHOLD     = 0.40
 MERGE_Z_THRESHOLD      = 0.50
  
-# A face must have at least this many hits before it is published
+# A face must have at least this many hits before it is published -was 8
 PUBLISH_COUNT_THRESHOLD = 8
  
 # ApproximateTimeSynchronizer queue/slop

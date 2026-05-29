@@ -1,3 +1,4 @@
+#!/usr/bin/env python3
 """Ring detector node. See README.md for design, topics, and tuning."""
 
 import rclpy
@@ -50,8 +51,6 @@ MIN_CENTRE_PATCH_PTS  = 2
 HOLE_DEPTH_MARGIN_M   = 0.03
 
 HOLE_INVALID_FRACTION = 0.60
-
-BACKPROJ_PATCH_HALF  = 8
 
 PENDING_MINHITS       = 3
 PENDING_KEEPTIME_NS   = int(4e9)
@@ -285,22 +284,30 @@ class RingDetector(Node):
             cx_d = int(round(ellipse_dep[0][0]))
             cy_d = int(round(ellipse_dep[0][1]))
 
-            perim_depths = self._perimeter_depths(depth_m, ellipse_dep)
-            valid_pd = perim_depths[
-                np.isfinite(perim_depths) &
-                (perim_depths > DEPTH_MIN_M) &
-                (perim_depths < DEPTH_MAX_M)]
+            # Rings are hollow: use the visible rim, never the wall seen through the hole.
+            ring_depths = self._ring_surface_depths(depth_m, binary, ellipse_dep)
+            valid_rd = ring_depths[
+                np.isfinite(ring_depths) &
+                (ring_depths > DEPTH_MIN_M) &
+                (ring_depths < DEPTH_MAX_M)]
 
-            if len(valid_pd) >= MIN_RING_DEPTH_PTS:
-                depth_val = float(np.median(valid_pd))
-            else:
+            if len(valid_rd) < MIN_RING_DEPTH_PTS:
+                perim_depths = self._perimeter_depths(depth_m, ellipse_dep)
+                valid_rd = perim_depths[
+                    np.isfinite(perim_depths) &
+                    (perim_depths > DEPTH_MIN_M) &
+                    (perim_depths < DEPTH_MAX_M)]
 
-                depth_val = self._sample_depth_patch(depth_m, cx_d, cy_d)
-                if depth_val is None:
-                    self._rej_stats['rej_depth'] += 1
-                    continue
+            if len(valid_rd) < MIN_RING_DEPTH_PTS:
+                self._rej_stats['rej_depth'] += 1
+                continue
 
-            point_cam = self._backproject(cx_d, cy_d, depth_val)
+            depth_val = float(np.median(valid_rd))
+
+            cx_rgb = float(ellipse_rgb[0][0])
+            cy_rgb = float(ellipse_rgb[0][1])
+
+            point_cam = self._backproject(cx_rgb, cy_rgb, depth_val)
             point_map = self._to_map(point_cam, self.camera_frame, stamp)
             if point_map is None:
                 self._rej_stats['rej_tf'] += 1
@@ -559,20 +566,29 @@ class RingDetector(Node):
         ys = np.clip(pts[:, 1], 0, h - 1)
         return depth_m[ys, xs]
 
-    def _sample_depth_patch(self, depth_m: np.ndarray,
-                            cx: int, cy: int) -> float | None:
+    def _ring_surface_depths(
+        self, depth_m: np.ndarray, binary: np.ndarray, ellipse
+    ) -> np.ndarray:
         h, w = depth_m.shape[:2]
-        r = BACKPROJ_PATCH_HALF
-        y0, y1 = max(0, cy - r), min(h, cy + r + 1)
-        x0, x1 = max(0, cx - r), min(w, cx + r + 1)
-        if y1 <= y0 or x1 <= x0:
-            return None
-        patch = depth_m[y0:y1, x0:x1]
-        valid = patch[(patch > DEPTH_MIN_M) & (patch < DEPTH_MAX_M) &
-                      np.isfinite(patch)]
-        if len(valid) < 4:
-            return None
-        return float(np.median(valid))
+
+        mask_outer = np.zeros((h, w), dtype=np.uint8)
+        mask_inner = np.zeros((h, w), dtype=np.uint8)
+        inner_ellipse = (
+            ellipse[0],
+            (ellipse[1][0] * INNER_SCALE, ellipse[1][1] * INNER_SCALE),
+            ellipse[2]
+        )
+
+        try:
+            cv2.ellipse(mask_outer, ellipse, 255, thickness=-1)
+            cv2.ellipse(mask_inner, inner_ellipse, 255, thickness=-1)
+        except Exception:
+            return np.array([], dtype=np.float32)
+
+        surface_mask = (binary > 0) & (mask_outer > 0) & (mask_inner == 0)
+        if not np.any(surface_mask):
+            return np.array([], dtype=np.float32)
+        return depth_m[surface_mask]
 
     def _classify_color(self, bgr: np.ndarray, ellipse) -> str:
         h, w = bgr.shape[:2]
@@ -622,7 +638,7 @@ class RingDetector(Node):
 
         return best_color
 
-    def _backproject(self, u: int, v: int, depth_m: float) -> np.ndarray:
+    def _backproject(self, u: float, v: float, depth_m: float) -> np.ndarray:
         X = (u - self.cx_cam) * depth_m / self.fx
         Y = (v - self.cy_cam) * depth_m / self.fy
         return np.array([X, Y, depth_m], dtype=float)
@@ -636,14 +652,22 @@ class RingDetector(Node):
         ps.point.y = float(point_cam[1])
         ps.point.z = float(point_cam[2])
 
-        timeout = Duration(seconds=0.02)
+        timeout     = Duration(seconds=0.15)
+        source_time = rclpy.time.Time.from_msg(stamp)
 
         try:
-            tf = self.tf_buffer.lookup_transform(
-                'odom', frame_id, rclpy.time.Time(), timeout)
+            tf = self.tf_buffer.lookup_transform('map', frame_id, source_time, timeout)
             return tfg.do_transform_point(ps, tf)
         except TransformException as te:
-            self.get_logger().debug(f'TF failed: {te}')
+            err = str(te).lower()
+            if 'extrapolation into the future' in err or 'lookup would require extrapolation' in err:
+                try:
+                    tf = self.tf_buffer.lookup_transform('map', frame_id, rclpy.time.Time(), timeout)
+                    return tfg.do_transform_point(ps, tf)
+                except TransformException as te2:
+                    self.get_logger().debug(f'Fallback TF failed: {te2}')
+                    return None
+            self.get_logger().debug(f'TF lookup failed: {te}')
             return None
 
     @staticmethod

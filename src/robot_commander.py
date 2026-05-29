@@ -73,11 +73,11 @@ DIRECT_HEADING_KP = 1.8
 # Drugi krog: robot gre po istih waypointih nazaj.
 # Pri vsakem waypointu obisce samo obraze/ringe, ki so temu waypointu najblizji.
 VISIT_MAX_DISTANCE_FROM_WAYPOINT = 1.60   # m; ce je detekcija dlje od vseh waypointov, jo preskoci
-VISIT_FACE_STANDOFF = 0.25                # m; koliko pred obrazom naj se ustavi
-VISIT_RING_STANDOFF = 0.25                # m; koliko pred ringom naj se ustavi
-VISIT_APPROACH_TOL = 0.11                 # m; toleranca pri direktnem obisku objekta
-VISIT_RETURN_TOL = 0.11                   # m; toleranca pri vrnitvi na waypoint
-VISIT_FACE_NO_APPROACH_DISTANCE = 0.25    # m; ce je obraz ze tako blizu waypointa, se robot samo obrne
+VISIT_FACE_STANDOFF = 0.35                # m; koliko pred obrazom naj se ustavi
+VISIT_RING_STANDOFF = 0.35                # m; koliko pred ringom naj se ustavi
+VISIT_APPROACH_TOL = 0.20                 # m; toleranca pri direktnem obisku objekta
+VISIT_RETURN_TOL = 0.20                   # m; toleranca pri vrnitvi na waypoint
+VISIT_FACE_NO_APPROACH_DISTANCE = 0.45    # m; ce je obraz ze tako blizu waypointa, se robot samo obrne
 
 class RobotCommander(Node):
 
