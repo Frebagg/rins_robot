@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 """Ring detector node. See README.md for design, topics, and tuning."""
 
 import rclpy
@@ -22,16 +21,22 @@ from tf2_ros.buffer import Buffer
 from tf2_ros.transform_listener import TransformListener
 from tf2_ros import TransformException
 
+# Frame to publish ring coordinates in. The face detection node uses 'map'
+# (requires SLAM running). 'odom' is always published by the base and is safe
+# when SLAM is not guaranteed. Set to 'map' if your downstream consumer and the
+# face node both work in the map frame.
+TARGET_FRAME       = 'map'
+
 DEPTH_MIN_M        = 0.30
-DEPTH_MAX_M        = 1.50
+DEPTH_MAX_M        = 1.5
 
 BINARY_DEPTH_MIN_M = 0.25
-BINARY_DEPTH_MAX_M = 1.50
+BINARY_DEPTH_MAX_M = 1.5
 
-MORPH_OPEN_K  = 1
-MORPH_CLOSE_K = 3
+MORPH_OPEN_K  = 3
+MORPH_CLOSE_K = 5
 
-MIN_CONTOUR_PTS  = 15
+MIN_CONTOUR_PTS  = 100
 AXIS_RATIO_MAX   = 3.5
 AXIS_MIN_PX      = 8
 AXIS_MAX_PX      = 260
@@ -52,7 +57,9 @@ HOLE_DEPTH_MARGIN_M   = 0.03
 
 HOLE_INVALID_FRACTION = 0.60
 
-PENDING_MINHITS       = 3
+BACKPROJ_PATCH_HALF  = 8
+
+PENDING_MINHITS       = 1
 PENDING_KEEPTIME_NS   = int(4e9)
 
 PENDING_XY_THR  = 0.55
@@ -62,7 +69,7 @@ MATCH_Z_THR     = 0.65
 MERGE_XY_THR    = 0.45
 MERGE_Z_THR     = 0.45
 
-PUBLISH_MIN_HITS = 6
+PUBLISH_MIN_HITS = 1
 
 SYNC_QUEUE  = 10
 SYNC_SLOP_S = 0.08
@@ -80,10 +87,10 @@ NEIGHBOURHOOD_DEPTH_BUCKETS = (
     (1.0, 99.0, 3),
 )
 
-BINARY_CLEANUP_K        = 5
+BINARY_CLEANUP_K        = 10
 BINARY_CLEANUP_MIN_FRAC = 0.50
 
-HOLLOW_ENABLE   = True
+HOLLOW_ENABLE   = False
 HOLLOW_K        = 5
 HOLLOW_MAX_FRAC = 0.85
 
@@ -280,34 +287,27 @@ class RingDetector(Node):
             color_name = self._classify_color(rgb, ellipse_rgb)
             if color_name == 'unknown':
                 self._rej_stats['rej_color'] += 1
+                continue
 
             cx_d = int(round(ellipse_dep[0][0]))
             cy_d = int(round(ellipse_dep[0][1]))
 
-            # Rings are hollow: use the visible rim, never the wall seen through the hole.
-            ring_depths = self._ring_surface_depths(depth_m, binary, ellipse_dep)
-            valid_rd = ring_depths[
-                np.isfinite(ring_depths) &
-                (ring_depths > DEPTH_MIN_M) &
-                (ring_depths < DEPTH_MAX_M)]
+            perim_depths = self._perimeter_depths(depth_m, ellipse_dep)
+            valid_pd = perim_depths[
+                np.isfinite(perim_depths) &
+                (perim_depths > DEPTH_MIN_M) &
+                (perim_depths < DEPTH_MAX_M)]
 
-            if len(valid_rd) < MIN_RING_DEPTH_PTS:
-                perim_depths = self._perimeter_depths(depth_m, ellipse_dep)
-                valid_rd = perim_depths[
-                    np.isfinite(perim_depths) &
-                    (perim_depths > DEPTH_MIN_M) &
-                    (perim_depths < DEPTH_MAX_M)]
+            if len(valid_pd) >= MIN_RING_DEPTH_PTS:
+                depth_val = float(np.median(valid_pd))
+            else:
 
-            if len(valid_rd) < MIN_RING_DEPTH_PTS:
-                self._rej_stats['rej_depth'] += 1
-                continue
+                depth_val = self._sample_depth_patch(depth_m, cx_d, cy_d)
+                if depth_val is None:
+                    self._rej_stats['rej_depth'] += 1
+                    continue
 
-            depth_val = float(np.median(valid_rd))
-
-            cx_rgb = float(ellipse_rgb[0][0])
-            cy_rgb = float(ellipse_rgb[0][1])
-
-            point_cam = self._backproject(cx_rgb, cy_rgb, depth_val)
+            point_cam = self._backproject(cx_d, cy_d, depth_val)
             point_map = self._to_map(point_cam, self.camera_frame, stamp)
             if point_map is None:
                 self._rej_stats['rej_tf'] += 1
@@ -566,29 +566,20 @@ class RingDetector(Node):
         ys = np.clip(pts[:, 1], 0, h - 1)
         return depth_m[ys, xs]
 
-    def _ring_surface_depths(
-        self, depth_m: np.ndarray, binary: np.ndarray, ellipse
-    ) -> np.ndarray:
+    def _sample_depth_patch(self, depth_m: np.ndarray,
+                            cx: int, cy: int) -> float | None:
         h, w = depth_m.shape[:2]
-
-        mask_outer = np.zeros((h, w), dtype=np.uint8)
-        mask_inner = np.zeros((h, w), dtype=np.uint8)
-        inner_ellipse = (
-            ellipse[0],
-            (ellipse[1][0] * INNER_SCALE, ellipse[1][1] * INNER_SCALE),
-            ellipse[2]
-        )
-
-        try:
-            cv2.ellipse(mask_outer, ellipse, 255, thickness=-1)
-            cv2.ellipse(mask_inner, inner_ellipse, 255, thickness=-1)
-        except Exception:
-            return np.array([], dtype=np.float32)
-
-        surface_mask = (binary > 0) & (mask_outer > 0) & (mask_inner == 0)
-        if not np.any(surface_mask):
-            return np.array([], dtype=np.float32)
-        return depth_m[surface_mask]
+        r = BACKPROJ_PATCH_HALF
+        y0, y1 = max(0, cy - r), min(h, cy + r + 1)
+        x0, x1 = max(0, cx - r), min(w, cx + r + 1)
+        if y1 <= y0 or x1 <= x0:
+            return None
+        patch = depth_m[y0:y1, x0:x1]
+        valid = patch[(patch > DEPTH_MIN_M) & (patch < DEPTH_MAX_M) &
+                      np.isfinite(patch)]
+        if len(valid) < 4:
+            return None
+        return float(np.median(valid))
 
     def _classify_color(self, bgr: np.ndarray, ellipse) -> str:
         h, w = bgr.shape[:2]
@@ -638,7 +629,7 @@ class RingDetector(Node):
 
         return best_color
 
-    def _backproject(self, u: float, v: float, depth_m: float) -> np.ndarray:
+    def _backproject(self, u: int, v: int, depth_m: float) -> np.ndarray:
         X = (u - self.cx_cam) * depth_m / self.fx
         Y = (v - self.cy_cam) * depth_m / self.fy
         return np.array([X, Y, depth_m], dtype=float)
@@ -655,14 +646,23 @@ class RingDetector(Node):
         timeout     = Duration(seconds=0.15)
         source_time = rclpy.time.Time.from_msg(stamp)
 
+        # Transform using the robot pose AT THE TIME THE IMAGE WAS CAPTURED,
+        # not the latest pose. Using the latest transform (rclpy.time.Time())
+        # places the point with the robot's *current* pose even though the
+        # pixel was observed earlier, which smears detections while moving.
         try:
-            tf = self.tf_buffer.lookup_transform('map', frame_id, source_time, timeout)
+            tf = self.tf_buffer.lookup_transform(
+                TARGET_FRAME, frame_id, source_time, timeout)
             return tfg.do_transform_point(ps, tf)
         except TransformException as te:
             err = str(te).lower()
-            if 'extrapolation into the future' in err or 'lookup would require extrapolation' in err:
+            if ('extrapolation into the future' in err or
+                    'lookup would require extrapolation' in err):
+                # The buffer hasn't caught up to this stamp yet: fall back to
+                # the most recent transform available.
                 try:
-                    tf = self.tf_buffer.lookup_transform('map', frame_id, rclpy.time.Time(), timeout)
+                    tf = self.tf_buffer.lookup_transform(
+                        TARGET_FRAME, frame_id, rclpy.time.Time(), timeout)
                     return tfg.do_transform_point(ps, tf)
                 except TransformException as te2:
                     self.get_logger().debug(f'Fallback TF failed: {te2}')
@@ -674,16 +674,34 @@ class RingDetector(Node):
     def _xy_dist(ax, ay, bx, by) -> float:
         return float(np.hypot(ax - bx, ay - by))
 
-    def _update_tracking(self, x, y, z, color, now):
+    @staticmethod
+    def _dom_color(votes) -> str:
+        return max(votes, key=votes.get) if votes else 'unknown'
 
+    def _confirmed_colors(self) -> set:
+        """Dominant colours currently held by confirmed rings."""
+        return {self._dom_color(v) for _id, _pt, _c, _t, v in self.confirmed}
+
+    def _update_tracking(self, x, y, z, color, now):
+        # One ring per colour. If a detection of this colour matches the
+        # already-confirmed ring of that colour (by position), refine it.
         if self._hit_confirmed(x, y, z, color, now):
             return
-
+        # If this colour is already confirmed but the detection didn't match
+        # the existing ring's position, drop it: we never confirm a second
+        # ring of an already-confirmed colour.
+        if color in self._confirmed_colors():
+            return
         self._hit_pending(x, y, z, color, now)
 
     def _hit_confirmed(self, x, y, z, color, now) -> bool:
+        # Association now requires matching colour AND position. With one ring
+        # per colour this uniquely identifies the ring and keeps a stray
+        # differently-coloured detection from polluting another ring's votes.
         best_i, best_d = -1, float('inf')
         for i, (ring_id, pt, count, last_seen, votes) in enumerate(self.confirmed):
+            if self._dom_color(votes) != color:
+                continue
             d_xy = self._xy_dist(pt.x, pt.y, x, y)
             d_z  = abs(pt.z - z)
             if d_xy <= MATCH_XY_THR and d_z <= MATCH_Z_THR and d_xy < best_d:
@@ -712,6 +730,7 @@ class RingDetector(Node):
                 best_i = i
 
         if best_i >= 0:
+            # Update an existing pending track.
             pt, count, _, votes = self.pending[best_i]
             w   = 1.0 / (count + 1)
             pt.x = pt.x * (1 - w) + x * w
@@ -720,20 +739,32 @@ class RingDetector(Node):
             votes[color] = votes.get(color, 0) + 1
             count += 1
             self.pending[best_i] = (pt, count, now, votes)
+            idx = best_i
+        else:
+            # First sighting of this ring: create a new pending track.
+            pt = Point()
+            pt.x, pt.y, pt.z = float(x), float(y), float(z)
+            count = 1
+            votes = {color: 1}
+            self.pending.append((pt, count, now, votes))
+            idx = len(self.pending) - 1
 
-            if count >= PENDING_MINHITS:
-                best_color = max(votes, key=votes.get)
-                self.get_logger().info(
-                    f'Ring confirmed! id={self.next_id} color={best_color} '
-                    f'map=({pt.x:.2f},{pt.y:.2f},{pt.z:.2f})')
-                self.confirmed.append((self.next_id, pt, count, now, votes))
-                self.next_id += 1
-                del self.pending[best_i]
-            return
-
-        p = Point()
-        p.x, p.y, p.z = float(x), float(y), float(z)
-        self.pending.append((p, 1, now, {color: 1}))
+        # Graduation check runs for BOTH paths, so with PENDING_MINHITS == 1 a
+        # brand-new detection is confirmed on the same frame it first appears.
+        if count >= PENDING_MINHITS:
+            best_color = max(votes, key=votes.get)
+            # One ring per colour: refuse to confirm if this colour already
+            # exists among confirmed rings (e.g. two same-colour blobs in one
+            # frame — the first confirms, the rest are dropped here).
+            if best_color in self._confirmed_colors():
+                del self.pending[idx]
+                return
+            self.get_logger().info(
+                f'Ring confirmed! id={self.next_id} color={best_color} '
+                f'{TARGET_FRAME}=({pt.x:.2f},{pt.y:.2f},{pt.z:.2f})')
+            self.confirmed.append((self.next_id, pt, count, now, votes))
+            self.next_id += 1
+            del self.pending[idx]
 
     def _remove_stale_pending(self, now):
         self.pending = [
@@ -754,6 +785,8 @@ class RingDetector(Node):
                 if j in used:
                     continue
                 id_j, pt_j, c_j, t_j, v_j = self.confirmed[j]
+                if self._dom_color(v_i) != self._dom_color(v_j):
+                    continue
                 if (self._xy_dist(pt_i.x, pt_i.y, pt_j.x, pt_j.y) <= MERGE_XY_THR
                         and abs(pt_i.z - pt_j.z) <= MERGE_Z_THR):
                     total = c_i + c_j
