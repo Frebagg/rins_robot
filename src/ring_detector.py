@@ -110,6 +110,19 @@ COLOR_RANGES_HSV = {
 
 COLOR_DOMINANCE_THR = 0.30
 
+# ---------------------------------------------------------------------------
+# Precomputed constants (perf): avoid re-allocating these on every frame /
+# every candidate. Functionally identical to building them inline.
+# ---------------------------------------------------------------------------
+_COLOR_RANGES_NP = {
+    color: [(np.array(lo, dtype=np.uint8), np.array(hi, dtype=np.uint8))
+            for lo, hi in ranges]
+    for color, ranges in COLOR_RANGES_HSV.items()
+}
+_KERNEL_OPEN  = np.ones((MORPH_OPEN_K,  MORPH_OPEN_K),  dtype=np.uint8)
+_KERNEL_CLOSE = np.ones((MORPH_CLOSE_K, MORPH_CLOSE_K), dtype=np.uint8)
+
+
 class RingDetector(Node):
 
     def __init__(self):
@@ -199,7 +212,10 @@ class RingDetector(Node):
         depth_raw = cv2.medianBlur(depth_raw, 5)
 
         depth_m = depth_raw.astype(np.float32) / 1000.0
-        depth_m[~np.isfinite(depth_m)] = 0.0
+        # Perf: integer depth sources (16UC1) can never produce NaN/inf after
+        # the cast, so the isfinite scrub is only needed for float encodings.
+        if not np.issubdtype(depth_raw.dtype, np.integer):
+            depth_m[~np.isfinite(depth_m)] = 0.0
 
         depth_m[depth_m > DEPTH_MAX_M] = 0.0
 
@@ -208,9 +224,14 @@ class RingDetector(Node):
 
         depth_m[h_dep // 2:, :] = 0.0
 
-        valid = (depth_m > DEPTH_MIN_M) & (depth_m < DEPTH_MAX_M)
-        binary = np.zeros(depth_m.shape, dtype=np.uint8)
-        binary[valid & (depth_m > BINARY_DEPTH_MIN_M) & (depth_m < BINARY_DEPTH_MAX_M)] = 255
+        # Perf: single fused range test. Identical result to the previous
+        # valid-mask & binary-range combination because the binary range is a
+        # superset of (DEPTH_MIN_M, DEPTH_MAX_M) on both ends here, and depth_m
+        # is already zeroed above DEPTH_MAX_M.
+        lo = max(DEPTH_MIN_M, BINARY_DEPTH_MIN_M)
+        hi = min(DEPTH_MAX_M, BINARY_DEPTH_MAX_M)
+        binary = (((depth_m > lo) & (depth_m < hi))
+                  .astype(np.uint8) * 255)
 
         rgb_at_dep_res = cv2.resize(rgb, (w_dep, h_dep),
                                     interpolation=cv2.INTER_AREA)
@@ -223,10 +244,8 @@ class RingDetector(Node):
         binary = self._sparse_neighbourhood_cleanup(
             binary, BINARY_CLEANUP_K, BINARY_CLEANUP_MIN_FRAC)
 
-        ko = np.ones((MORPH_OPEN_K,  MORPH_OPEN_K),  dtype=np.uint8)
-        kc = np.ones((MORPH_CLOSE_K, MORPH_CLOSE_K), dtype=np.uint8)
-        binary = cv2.morphologyEx(binary, cv2.MORPH_OPEN,  ko)
-        binary = cv2.morphologyEx(binary, cv2.MORPH_CLOSE, kc)
+        binary = cv2.morphologyEx(binary, cv2.MORPH_OPEN,  _KERNEL_OPEN)
+        binary = cv2.morphologyEx(binary, cv2.MORPH_CLOSE, _KERNEL_CLOSE)
 
         if HOLLOW_ENABLE:
             binary = self._hollow_out(binary, HOLLOW_K, HOLLOW_MAX_FRAC)
@@ -260,7 +279,23 @@ class RingDetector(Node):
                 self._rej_stats['rej_residual'] += 1
                 continue
 
-            if not self._ellipse_has_real_hole(depth_m, ellipse_dep):
+            # Perf: perimeter depths were previously computed twice per
+            # candidate (once inside the hole check, once again later for the
+            # depth estimate). Compute once here and reuse.
+            perim_depths = self._perimeter_depths(depth_m, ellipse_dep)
+            valid_pd = perim_depths[
+                np.isfinite(perim_depths) &
+                (perim_depths > DEPTH_MIN_M) &
+                (perim_depths < DEPTH_MAX_M)]
+
+            if len(valid_pd) < MIN_RING_DEPTH_PTS:
+                self.get_logger().debug(
+                    f'_ellipse_has_real_hole: insufficient perimeter depth samples ({len(valid_pd)})')
+                self._rej_stats['rej_hole'] += 1
+                continue
+            ring_depth = float(np.median(valid_pd))
+
+            if not self._ellipse_has_real_hole(depth_m, ellipse_dep, ring_depth):
                 self._rej_stats['rej_hole'] += 1
                 continue
 
@@ -272,7 +307,7 @@ class RingDetector(Node):
                 ellipse_dep[2]
             )
 
-            candidates.append((ellipse_dep, ellipse_rgb))
+            candidates.append((ellipse_dep, ellipse_rgb, ring_depth))
             self._rej_stats['candidates'] += 1
             raw_ellipses_rgb.append(ellipse_dep)
 
@@ -282,9 +317,14 @@ class RingDetector(Node):
         now   = self.get_clock().now()
         stamp = rgb_msg.header.stamp
 
-        for ellipse_dep, ellipse_rgb in candidates:
+        # Perf: one HSV conversion of the full-resolution RGB frame, shared by
+        # all candidates (previously converted once per candidate). Computed
+        # lazily so frames without candidates skip it entirely.
+        hsv_full = cv2.cvtColor(rgb, cv2.COLOR_BGR2HSV) if candidates else None
 
-            color_name = self._classify_color(rgb, ellipse_rgb)
+        for ellipse_dep, ellipse_rgb, ring_depth in candidates:
+
+            color_name = self._classify_color(hsv_full, ellipse_rgb)
             if color_name == 'unknown':
                 self._rej_stats['rej_color'] += 1
                 continue
@@ -292,15 +332,12 @@ class RingDetector(Node):
             cx_d = int(round(ellipse_dep[0][0]))
             cy_d = int(round(ellipse_dep[0][1]))
 
-            perim_depths = self._perimeter_depths(depth_m, ellipse_dep)
-            valid_pd = perim_depths[
-                np.isfinite(perim_depths) &
-                (perim_depths > DEPTH_MIN_M) &
-                (perim_depths < DEPTH_MAX_M)]
-
-            if len(valid_pd) >= MIN_RING_DEPTH_PTS:
-                depth_val = float(np.median(valid_pd))
-            else:
+            # Candidates only reach this point with enough valid perimeter
+            # samples (checked above), so the ring depth is the perimeter
+            # median computed in the first loop. The centre-patch fallback for
+            # the insufficient-samples case is kept for safety.
+            depth_val = ring_depth
+            if depth_val is None:
 
                 depth_val = self._sample_depth_patch(depth_m, cx_d, cy_d)
                 if depth_val is None:
@@ -359,36 +396,57 @@ class RingDetector(Node):
         h, w = bgr.shape[:2]
         out = np.zeros((h, w), dtype=np.uint8)
 
-        bucket_masks = {}
-        needed_K = set()
-        for lo, hi, K in NEIGHBOURHOOD_DEPTH_BUCKETS:
-            m = (depth_m >= lo) & (depth_m < hi)
-            bucket_masks[(lo, hi, K)] = m
-            if m.any():
-                needed_K.add(K)
+        # depth_m has already been scrubbed of non-finite values upstream, so
+        # validity reduces to a positivity test.
+        valid = depth_m > 0.0
+        if not valid.any():
+            return out
 
-        results = {}
-        for K in needed_K:
-            results[K] = self._neighbourhood_pass(bgr, depth_m, K)
+        # Perf: LAB conversion done once per frame and cropped per bucket
+        # (previously recomputed for every kernel size).
+        lab = cv2.cvtColor(bgr, cv2.COLOR_BGR2LAB).astype(np.int32)
 
-        for (lo, hi, K), m in bucket_masks.items():
-            if K in results:
-                out[m] = results[K][m]
+        # Perf: the per-pixel result only matters where the pixel itself is
+        # valid AND inside the bucket's depth band (output is forced to 0
+        # everywhere else, exactly as before). So each kernel pass is run only
+        # on the bounding box of its bucket's valid pixels, expanded by the
+        # kernel radius so every neighbourhood window sees the same data it
+        # would in a full-frame pass. With the bottom half of the depth image
+        # zeroed upstream, this cuts the work dramatically — especially for
+        # the expensive K=9 near-range bucket.
+        for blo, bhi, K in NEIGHBOURHOOD_DEPTH_BUCKETS:
+            m = (depth_m >= blo) & (depth_m < bhi) & valid
+            ys, xs = np.nonzero(m)
+            if ys.size == 0:
+                continue
+            pad = K // 2
+            y0 = max(0, int(ys.min()) - pad)
+            y1 = min(h, int(ys.max()) + 1 + pad)
+            x0 = max(0, int(xs.min()) - pad)
+            x1 = min(w, int(xs.max()) + 1 + pad)
+
+            res = self._neighbourhood_pass(
+                lab[y0:y1, x0:x1],
+                depth_m[y0:y1, x0:x1],
+                valid[y0:y1, x0:x1],
+                K)
+
+            sub = m[y0:y1, x0:x1]
+            roi = out[y0:y1, x0:x1]
+            roi[sub] = res[sub]
         return out
 
     @staticmethod
     def _neighbourhood_pass(
-        bgr: np.ndarray, depth_m: np.ndarray, K: int
+        lab: np.ndarray, depth_m: np.ndarray, valid: np.ndarray, K: int
     ) -> np.ndarray:
         thr_color2 = float(NEIGHBOURHOOD_DE_THR * NEIGHBOURHOOD_DE_THR)
 
-        lab = cv2.cvtColor(bgr, cv2.COLOR_BGR2LAB).astype(np.int32)
         h, w = lab.shape[:2]
         lab_l = lab[..., 0]
         lab_a = lab[..., 1]
         lab_b = lab[..., 2]
 
-        valid = (depth_m > 0.0) & np.isfinite(depth_m)
         valid_u8 = valid.astype(np.uint8)
 
         depth_thr = (NEIGHBOURHOOD_DZ_REL_THR * depth_m).astype(np.float32)
@@ -401,7 +459,12 @@ class RingDetector(Node):
         valid_pad = cv2.copyMakeBorder(valid_u8, pad, pad, pad, pad,
                                        cv2.BORDER_CONSTANT, value=0)
 
-        agree_count = np.zeros((h, w), dtype=np.int32)
+        # Perf: the centre offset (dy == dx == pad) always agrees with itself
+        # wherever the pixel is valid (zero colour distance below threshold,
+        # zero depth difference below the strictly positive relative
+        # threshold), so it is folded in here instead of running a full shift
+        # iteration for it.
+        agree_count = valid.astype(np.int32)
         valid_count = np.rint(
             cv2.boxFilter(valid_u8.astype(np.float32), -1, (K, K),
                           normalize=False, borderType=cv2.BORDER_CONSTANT)
@@ -409,10 +472,18 @@ class RingDetector(Node):
 
         for dy in range(K):
             for dx in range(K):
+                if dy == pad and dx == pad:
+                    continue
                 dl = l_pad[dy:dy + h, dx:dx + w] - lab_l
                 da = a_pad[dy:dy + h, dx:dx + w] - lab_a
                 db = b_pad[dy:dy + h, dx:dx + w] - lab_b
-                d2_color = dl * dl + da * da + db * db
+                # Perf: square in place to avoid extra temporaries.
+                np.multiply(dl, dl, out=dl)
+                np.multiply(da, da, out=da)
+                np.multiply(db, db, out=db)
+                dl += da
+                dl += db
+                d2_color = dl
 
                 dz = np.abs(depth_pad[dy:dy + h, dx:dx + w] - depth_m)
                 v = valid_pad[dy:dy + h, dx:dx + w]
@@ -434,10 +505,9 @@ class RingDetector(Node):
         hsv = cv2.cvtColor(bgr, cv2.COLOR_BGR2HSV)
         h, w = hsv.shape[:2]
         out = np.zeros((h, w), dtype=np.uint8)
-        for _color, ranges in COLOR_RANGES_HSV.items():
+        for _color, ranges in _COLOR_RANGES_NP.items():
             for lo, hi in ranges:
-                out |= cv2.inRange(hsv, np.array(lo, dtype=np.uint8),
-                                        np.array(hi, dtype=np.uint8))
+                out |= cv2.inRange(hsv, lo, hi)
         return out
 
     @staticmethod
@@ -486,19 +556,27 @@ class RingDetector(Node):
         dists = np.sqrt(pts[:, 0] ** 2 + pts[:, 1] ** 2)
         return float(np.mean(np.abs(dists - 1.0)))
 
-    def _ellipse_has_real_hole(self, depth_m: np.ndarray, ellipse) -> bool:
-        h, w = depth_m.shape[:2]
+    @staticmethod
+    def _ellipse_roi(shape, ellipse, margin: int = 2):
+        """Integer bounding box (clamped to image) that fully contains the
+        ellipse. Used to draw/sample ellipse masks on a small crop instead of
+        allocating full-frame masks (perf). Returns None if the box is empty.
+        """
+        h, w = shape[:2]
+        (ecx, ecy), (ea1, ea2), _ang = ellipse
+        r = 0.5 * max(ea1, ea2) + margin
+        x0 = max(0, int(np.floor(ecx - r)))
+        x1 = min(w, int(np.ceil(ecx + r)) + 1)
+        y0 = max(0, int(np.floor(ecy - r)))
+        y1 = min(h, int(np.ceil(ecy + r)) + 1)
+        if x1 <= x0 or y1 <= y0:
+            return None
+        return x0, y0, x1, y1
 
-        perim = self._perimeter_depths(depth_m, ellipse)
-        valid_perim = perim[
-            np.isfinite(perim) &
-            (perim > DEPTH_MIN_M) &
-            (perim < DEPTH_MAX_M)]
-        if len(valid_perim) < MIN_RING_DEPTH_PTS:
-            self.get_logger().debug(
-                f'_ellipse_has_real_hole: insufficient perimeter depth samples ({len(valid_perim)})')
-            return False
-        ring_depth = float(np.median(valid_perim))
+    def _ellipse_has_real_hole(self, depth_m: np.ndarray, ellipse,
+                               ring_depth: float) -> bool:
+        # ring_depth: median of valid perimeter depths, computed by the caller
+        # (which also enforces MIN_RING_DEPTH_PTS before calling).
 
         inner_ellipse = (
             ellipse[0],
@@ -506,19 +584,30 @@ class RingDetector(Node):
             ellipse[2]
         )
 
-        mask_inner = np.zeros((h, w), dtype=np.uint8)
+        # Perf: draw the inner-ellipse mask on a crop around the ellipse
+        # instead of a full-frame buffer. Pixel-identical because the integer
+        # ROI shift preserves cv2's centre/axis rounding.
+        roi = self._ellipse_roi(depth_m.shape, ellipse)
+        if roi is None:
+            self.get_logger().debug('_ellipse_has_real_hole: inner ellipse produced no pixels')
+            return False
+        x0, y0, x1, y1 = roi
+        inner_shifted = (
+            (inner_ellipse[0][0] - x0, inner_ellipse[0][1] - y0),
+            inner_ellipse[1],
+            inner_ellipse[2]
+        )
+        mask_inner = np.zeros((y1 - y0, x1 - x0), dtype=np.uint8)
         try:
-            cv2.ellipse(mask_inner, inner_ellipse, 255, thickness=-1)
+            cv2.ellipse(mask_inner, inner_shifted, 255, thickness=-1)
         except Exception:
             self.get_logger().debug('_ellipse_has_real_hole: failed to draw inner ellipse mask')
             return False
 
-        ys, xs = np.where(mask_inner > 0)
-        if len(ys) == 0:
+        hole_raw = depth_m[y0:y1, x0:x1][mask_inner > 0]
+        if hole_raw.size == 0:
             self.get_logger().debug('_ellipse_has_real_hole: inner ellipse produced no pixels')
             return False
-
-        hole_raw = depth_m[ys, xs]
 
         n_total   = len(hole_raw)
         n_invalid = int(np.sum(
@@ -581,19 +670,29 @@ class RingDetector(Node):
             return None
         return float(np.median(valid))
 
-    def _classify_color(self, bgr: np.ndarray, ellipse) -> str:
-        h, w = bgr.shape[:2]
-
+    def _classify_color(self, hsv: np.ndarray, ellipse) -> str:
+        # hsv: full-resolution HSV frame, converted once per frame by the
+        # caller and shared across candidates (perf).
         inner_ell = (
             ellipse[0],
             (ellipse[1][0] * INNER_SCALE, ellipse[1][1] * INNER_SCALE),
             ellipse[2]
         )
-        mask_outer = np.zeros((h, w), dtype=np.uint8)
-        mask_inner = np.zeros((h, w), dtype=np.uint8)
+
+        # Perf: build the rim mask and run the colour counting on a crop
+        # around the ellipse instead of full-frame buffers per candidate.
+        roi = self._ellipse_roi(hsv.shape, ellipse)
+        if roi is None:
+            return 'unknown'
+        x0, y0, x1, y1 = roi
+        rh, rw = y1 - y0, x1 - x0
+        shift = lambda e: ((e[0][0] - x0, e[0][1] - y0), e[1], e[2])
+
+        mask_outer = np.zeros((rh, rw), dtype=np.uint8)
+        mask_inner = np.zeros((rh, rw), dtype=np.uint8)
         try:
-            cv2.ellipse(mask_outer, ellipse,    255, thickness=-1)
-            cv2.ellipse(mask_inner, inner_ell,  255, thickness=-1)
+            cv2.ellipse(mask_outer, shift(ellipse),   255, thickness=-1)
+            cv2.ellipse(mask_inner, shift(inner_ell), 255, thickness=-1)
         except Exception:
             return 'unknown'
         rim_mask = cv2.subtract(mask_outer, mask_inner)
@@ -602,15 +701,14 @@ class RingDetector(Node):
 
             return 'unknown'
 
-        hsv = cv2.cvtColor(bgr, cv2.COLOR_BGR2HSV)
+        hsv_roi = hsv[y0:y1, x0:x1]
 
         best_color = None
         best_count = 0
-        for color, ranges in COLOR_RANGES_HSV.items():
-            color_mask = np.zeros((h, w), dtype=np.uint8)
+        for color, ranges in _COLOR_RANGES_NP.items():
+            color_mask = np.zeros((rh, rw), dtype=np.uint8)
             for lo, hi in ranges:
-                color_mask |= cv2.inRange(hsv, np.array(lo, dtype=np.uint8),
-                                               np.array(hi, dtype=np.uint8))
+                color_mask |= cv2.inRange(hsv_roi, lo, hi)
 
             count = int(np.count_nonzero(cv2.bitwise_and(rim_mask, color_mask)))
             if count > best_count:
