@@ -4,8 +4,8 @@
 Face detection node for TurtleBot4 with Gemini 355L camera (real world).
  
 Architecture:
-  - Subscribes to /gemini/color/image_raw  (RGB)
-  - Subscribes to /gemini/depth/image_raw  (16-bit depth in mm, aligned to colour)
+  - Subscribes to /gemini/color/image_raw/compressed  (RGB)
+  - Subscribes to /gemini/depth/image_raw/compressedDepth  (16-bit depth in mm, aligned to colour)
   - Subscribes to /gemini/depth/camera_info (intrinsics)
   - Uses ApproximateTimeSynchronizer to pair every RGB frame with its depth frame
   - Runs YOLOv8n (person class) on the RGB image
@@ -24,10 +24,11 @@ from rclpy.qos import qos_profile_sensor_data
  
 import message_filters
  
-from sensor_msgs.msg import Image, CameraInfo
+from sensor_msgs.msg import CameraInfo, CompressedImage
 from cv_bridge import CvBridge, CvBridgeError
 import cv2
 import numpy as np
+import struct
  
 import tf2_geometry_msgs as tfg
 from tf2_ros import TransformException
@@ -53,17 +54,17 @@ CONFIDENCE_THRESHOLD   = 0.7
  
 # Depth validity range [metres].  Faces on walls are typically 0.4 – 3.5 m away.
 DEPTH_MIN_M            = 0.15
-DEPTH_MAX_M            = 2.50
+DEPTH_MAX_M            = 1.75
  
 # Median-depth sampling: half-size of the square patch around bbox centre [pixels]
-DEPTH_PATCH_HALF       = 8    # samples a 17×17 patch
+DEPTH_PATCH_HALF       = 5    # samples a 17×17 patch
  
 # Pending-stage: how many consistent hits needed before a detection is confirmed -was 4
-MINHITS                = 4
+MINHITS                = 2
  
 # Matching radius for associating a new detection with an existing pending entry [m]
-PENDING_XY_THRESHOLD   = 0.65
-PENDING_Z_THRESHOLD    = 0.50
+PENDING_XY_THRESHOLD   = 0.35
+PENDING_Z_THRESHOLD    = 0.35
  
 # Maximum age of a pending entry before it is discarded [nanoseconds]
 PENDING_KEEPTIME_NS    = int(6e9)   # 6 seconds
@@ -77,11 +78,14 @@ MERGE_XY_THRESHOLD     = 0.40
 MERGE_Z_THRESHOLD      = 0.50
  
 # A face must have at least this many hits before it is published -was 8
-PUBLISH_COUNT_THRESHOLD = 8
+PUBLISH_COUNT_THRESHOLD = 2
  
 # ApproximateTimeSynchronizer queue/slop
 SYNC_QUEUE_SIZE        = 10
 SYNC_SLOP_S            = 0.08   # 80 ms – generous for real camera
+
+RGB_TOPIC              = '/gemini/color/image_raw/compressed'
+DEPTH_TOPIC            = '/gemini/depth/image_raw/compressedDepth'
  
  
 # ---------------------------------------------------------------------------
@@ -121,8 +125,8 @@ class detect_faces(Node):
         )
  
         # Synchronised RGB + depth subscriptions
-        self.rgb_sub   = message_filters.Subscriber(self, Image, '/gemini/color/image_raw',   qos_profile=sensor_qos)
-        self.depth_sub = message_filters.Subscriber(self, Image, '/gemini/depth/image_raw',   qos_profile=sensor_qos)
+        self.rgb_sub   = message_filters.Subscriber(self, CompressedImage, RGB_TOPIC,   qos_profile=sensor_qos)
+        self.depth_sub = message_filters.Subscriber(self, CompressedImage, DEPTH_TOPIC, qos_profile=sensor_qos)
  
         self.sync = message_filters.ApproximateTimeSynchronizer(
             [self.rgb_sub, self.depth_sub],
@@ -181,7 +185,7 @@ class detect_faces(Node):
     # Main synchronised RGB + depth callback
     # ------------------------------------------------------------------
  
-    def rgbdCallback(self, rgb_msg: Image, depth_msg: Image):
+    def rgbdCallback(self, rgb_msg: CompressedImage, depth_msg: CompressedImage):
         """Called once per synchronised (RGB, depth) pair."""
  
         # Drop frames until intrinsics are available
@@ -191,10 +195,13 @@ class detect_faces(Node):
  
         # ----- Decode images -----
         try:
-            rgb   = self.bridge.imgmsg_to_cv2(rgb_msg,   desired_encoding='bgr8')
-            depth = self.bridge.imgmsg_to_cv2(depth_msg, desired_encoding='passthrough')
+            rgb = self.bridge.compressed_imgmsg_to_cv2(rgb_msg, desired_encoding='bgr8')
+            depth = self._decodeCompressedDepth(depth_msg)
         except CvBridgeError as e:
             self.get_logger().error(f'CvBridge error: {e}')
+            return
+        except ValueError as e:
+            self.get_logger().error(f'Compressed depth decode failed: {e}')
             return
  
         # depth is uint16 in millimetres for the Gemini 355L
@@ -319,6 +326,51 @@ class detect_faces(Node):
     # ------------------------------------------------------------------
     # Depth helpers
     # ------------------------------------------------------------------
+
+    @staticmethod
+    def _decodeCompressedDepth(msg: CompressedImage) -> np.ndarray:
+        data = bytes(msg.data)
+        if not data:
+            raise ValueError('empty payload')
+
+        png_signature = b'\x89PNG\r\n\x1a\n'
+        png_start = data.find(png_signature)
+        if png_start < 0:
+            png_start = 0
+
+        decoded = cv2.imdecode(
+            np.frombuffer(data[png_start:], dtype=np.uint8),
+            cv2.IMREAD_UNCHANGED,
+        )
+        if decoded is None:
+            raise ValueError(f'OpenCV could not decode payload format={msg.format!r}')
+
+        if decoded.ndim == 3:
+            decoded = decoded[:, :, 0]
+
+        if '32FC1' in msg.format:
+            if png_start < 12:
+                raise ValueError('32FC1 compressedDepth payload missing config header')
+            _, depth_quant_a, depth_quant_b = struct.unpack_from('<iff', data, 0)
+            inv_depth = decoded.astype(np.float32)
+            depth_m = np.zeros(inv_depth.shape, dtype=np.float32)
+            valid = inv_depth > 0.0
+            denom = inv_depth[valid] - depth_quant_b
+            good = denom > 0.0
+            depth_m_valid = np.zeros_like(denom, dtype=np.float32)
+            depth_m_valid[good] = depth_quant_a / denom[good]
+            depth_m[valid] = depth_m_valid
+            depth_m[~np.isfinite(depth_m)] = 0.0
+            return np.clip(depth_m * 1000.0, 0, np.iinfo(np.uint16).max).astype(np.uint16)
+
+        if decoded.dtype == np.uint16:
+            return decoded
+
+        if np.issubdtype(decoded.dtype, np.floating):
+            decoded = np.nan_to_num(decoded, nan=0.0, posinf=0.0, neginf=0.0)
+            return np.clip(decoded * 1000.0, 0, np.iinfo(np.uint16).max).astype(np.uint16)
+
+        return decoded.astype(np.uint16)
  
     def _sampleDepth(self, depth_img: np.ndarray, cx: int, cy: int):
         """
